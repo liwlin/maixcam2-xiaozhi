@@ -1,0 +1,9 @@
+id: xiaozhi
+name: XiaoZhi AI
+name[zh]: 小智AI
+version: 1.0.0
+icon: assets/icon.png
+author: yizhen
+desc: XiaoZhi AI voice assistant settings
+desc[zh]: 小智AI语音助手设置（唤醒对话由后台服务负责）
+exec: main.py

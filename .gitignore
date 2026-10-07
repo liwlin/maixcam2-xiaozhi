@@ -1,0 +1,26 @@
+# ---- 设备凭据：绝对不能进仓库 ----
+config.json
+state.json
+**/config.json
+**/state.json
+
+# ---- 大二进制 / 设备产物 ----
+*.raw
+*.rgba
+*.so
+*.so.*
+*.onnx
+*.aiff
+*.wav
+*.pyc
+__pycache__/
+
+# ---- 设备快照里的模型与预编译库（52MB，另有来源）----
+device_snapshot/root_xiaozhi/models/
+device_snapshot/root_xiaozhi/sherpa_rt/
+device_snapshot/root_xiaozhi/sherpa_lib/
+device_snapshot/root_xiaozhi/icons/
+
+# ---- 系统垃圾 ----
+.DS_Store
+*.swp

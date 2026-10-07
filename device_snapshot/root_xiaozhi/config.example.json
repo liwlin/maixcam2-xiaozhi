@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "popup_enabled": true,
+  "touch_wake": true,
+  "wake_words": ["你好小智"],
+  "ota_url": "https://api.tenclass.net/xiaozhi/ota/",
+  "app_version": "2.0.0",
+  "client_id": "<首次启动自动生成 uuid4>",
+  "serial_number": "<首次启动自动生成>",
+  "hmac_key": "<首次启动自动生成 32 字节 hex，不对外>",
+  "activated": false,
+  "volume": 80,
+  "mic_gain": 40,
+  "vad_silence_ms": 650,
+  "idle_close_s": 20
+}

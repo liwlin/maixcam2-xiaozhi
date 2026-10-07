@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+小智AI 设置 App（MaixCAM2）—— 严格按 MaixPy 官方文档实现
+文档：https://wiki.sipeed.com/maixpy/doc/zh/vision/touchscreen.html
+
+架构（用户定义）：
+  - 后台服务 /root/xiaozhi/xiaozhi_service.py（systemd 开机自启）负责
+    语音唤醒 / AI 对话 / 弹窗显示等全部主要功能，
+    并以短间隔轮询 /root/xiaozhi/config.json，有修改立即执行。
+  - 本 App 只是"小智设置"软件：显示状态 + 编辑配置文件，不直接控制服务。
+
+关键修复：launcher 通过 systemd drop-in 向子进程注入
+LD_PRELOAD=libmaixcam2_overlay.so，该注入库在 App 进程内会导致
+VO 首帧 DRM commit 永久等待 vblank（线程 D 状态），后续 push 全部
+快速失败 → disp.show() 死循环重试 → 黑屏 + 100% CPU。
+因此必须在导入 maix 之前剥除注入环境并重新执行自身，
+使本进程成为 100% 干净的标准 MaixPy 进程（实测 VO 正常）。
+"""
+import os
+import sys
+
+# ---- 启动剥毒：任何 maix 导入之前执行（只跑一次，重执行后环境已干净） ----
+_STRIP_KEYS = ("LD_PRELOAD", "MAIXCAM2_GF", "MAIXCAM2_OVL", "MAIXCAM2_GF_LOG")
+if any(os.environ.get(k) for k in _STRIP_KEYS):
+    _env = {k: v for k, v in os.environ.items() if k not in _STRIP_KEYS}
+    _argv = ["/usr/bin/python3", os.path.abspath(__file__)] + sys.argv[1:]
+    try:
+        os.execve("/usr/bin/python3", _argv, _env)
+    except Exception as e:  # pragma: no cover - 理论不可达
+        print("[xiaozhi-app] strip re-exec failed:", e, flush=True)
+
+import json
+import signal
+
+from maix import app, display, image, time, touchscreen
+
+CFG_PATH = "/root/xiaozhi/config.json"
+STATE_PATH = "/root/xiaozhi/state.json"
+WAKE_PRESETS = ["你好小智", "小智", "嗨小智", "你好小夏", "你好小哈"]
+UI_SNAPSHOT = "/tmp/xiaozhi_ui.png"
+
+print("[xiaozhi-app] clean start, pid", os.getpid(), flush=True)
+
+# ---- 显示 / 触摸：严格按文档顺序初始化 ----
+disp = display.Display()
+W, H = disp.width(), disp.height()
+print("[xiaozhi-app] display size:", W, H, flush=True)
+ts = touchscreen.TouchScreen()
+
+img = image.Image(W, H)  # 文档模式：整屏画布只创建一次
+
+# 中文字体（失败则退回默认字体，不影响运行）
+try:
+    image.load_font("zh", "/maixapp/share/font/SourceHanSansCN-Regular.otf", size=20)
+    image.set_default_font("zh")
+except Exception as e:
+    print("[xiaozhi-app] zh font load failed, use default:", e, flush=True)
+
+
+def C(r, g, b):
+    return image.Color.from_rgb(r, g, b)
+
+
+COL_HEADER = C(46, 125, 178)   # 标题栏蓝
+COL_BG = C(16, 26, 40)         # 深蓝底
+COL_ROW = C(24, 38, 56)        # 行底
+COL_TEXT = C(235, 238, 245)
+COL_SUB = C(150, 160, 178)
+COL_ON = C(41, 182, 246)       # 开关开启
+COL_OFF = C(70, 78, 92)        # 开关关闭
+COL_OK = C(80, 220, 120)
+COL_WARN = C(255, 159, 10)
+
+
+def load_cfg():
+    try:
+        with open(CFG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {"enabled": True, "popup_enabled": True,
+                "wake_words": ["你好小智"]}
+
+
+def save_cfg(cfg):
+    try:
+        tmp = CFG_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CFG_PATH)
+        print("[xiaozhi-app] cfg saved:", cfg, flush=True)
+    except Exception as e:
+        print("[xiaozhi-app] save cfg err:", e, flush=True)
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ---- 布局 ----
+HEADER_H = 50
+ROWS_TOP = 62
+ROW_H = 56
+GAP = 6
+PAD = 14
+EXIT_LABEL = "< Exit"
+_exit_size = image.string_size(EXIT_LABEL)
+EXIT_BTN = [6, 8, _exit_size.width() + 16, _exit_size.height() + 14]
+TOGGLE_W, TOGGLE_H = 52, 28
+
+
+def in_btn(x, y, b):
+    return b[0] <= x <= b[0] + b[2] and b[1] <= y <= b[1] + b[3]
+
+
+def toggle_pos(row_idx):
+    y = ROWS_TOP + row_idx * (ROW_H + GAP)
+    return [W - PAD - TOGGLE_W, y + (ROW_H - TOGGLE_H) // 2, TOGGLE_W, TOGGLE_H]
+
+
+ROW_TOGGLE_SVC = 0
+ROW_TOGGLE_POP = 1
+ROW_WAKE = 5
+
+
+def draw_toggle(x, y, w, h, on):
+    img.draw_rect(x, y, w, h, COL_ON if on else COL_OFF, -1)
+    r = h
+    kx = (x + w - r) if on else x
+    img.draw_circle(kx + r // 2, y + h // 2, r // 2 - 3, COL_TEXT, -1)
+
+
+def draw_ui(cfg, st):
+    img.draw_rect(0, 0, W, H, COL_BG, -1)                       # 背景
+    img.draw_rect(0, 0, W, HEADER_H, COL_HEADER, -1)            # 标题栏
+    img.draw_string(EXIT_BTN[0] + 8, EXIT_BTN[1] + 7, EXIT_LABEL,
+                    COL_TEXT, 1.0)
+    img.draw_rect(EXIT_BTN[0], EXIT_BTN[1], EXIT_BTN[2], EXIT_BTN[3],
+                  COL_TEXT, 2)
+    title = "小智AI 设置"
+    tw = image.string_size(title).width() * 12 // 10
+    img.draw_string((W - tw) // 2, HEADER_H // 2 - 12, title, COL_TEXT, 1.2)
+
+    def row(idx, label, value=None, vcol=COL_SUB, tg=None):
+        y = ROWS_TOP + idx * (ROW_H + GAP)
+        img.draw_rect(PAD, y, W - PAD * 2, ROW_H, COL_ROW, -1)
+        img.draw_string(PAD + 14, y + ROW_H // 2 - 10, label, COL_TEXT, 1.0)
+        if tg is not None:
+            tx = toggle_pos(idx)
+            draw_toggle(tx[0], tx[1], tx[2], tx[3], tg)
+        elif value is not None:
+            vw = image.string_size(value).width()
+            img.draw_string(W - PAD - 14 - vw, y + ROW_H // 2 - 10,
+                            value, vcol, 1.0)
+
+    row(ROW_TOGGLE_SVC, "启用小智AI", tg=bool(cfg.get("enabled", True)))
+    row(ROW_TOGGLE_POP, "弹出聊天窗口",
+        tg=bool(cfg.get("popup_enabled", True)))
+
+    net = st.get("network", "检测中…")
+    ncol = COL_OK if net == "可用" else (
+        COL_WARN if net not in ("离线", "检测中…") else C(240, 100, 100))
+    row(2, "网络状态", net, ncol)
+
+    act = "已激活" if (st.get("activated") or cfg.get("activated")) else \
+        str(st.get("activation_code") or "未激活")
+    row(3, "激活码", act, COL_OK if act == "已激活" else COL_WARN)
+
+    row(4, "控制台", "xiaozhi.me", COL_SUB)
+
+    ww = (cfg.get("wake_words") or WAKE_PRESETS[:1])[0]
+    row(ROW_WAKE, "唤醒词(点击换)", ww, COL_ON)
+
+    img.draw_string(PAD + 6, H - 26, "修改即时生效 · 点 < Exit 返回",
+                    COL_SUB, 0.85)
+
+
+def click(row_idx, x, cfg):
+    """返回 True 表示配置有变化需要保存"""
+    if row_idx == ROW_TOGGLE_SVC:
+        cfg["enabled"] = not cfg.get("enabled", True)
+        return True
+    if row_idx == ROW_TOGGLE_POP:
+        cfg["popup_enabled"] = not cfg.get("popup_enabled", True)
+        return True
+    if row_idx == ROW_WAKE:
+        words = list(cfg.get("wake_words") or WAKE_PRESETS[:1])
+        cur = words[0] if words else WAKE_PRESETS[0]
+        try:
+            idx = WAKE_PRESETS.index(cur)
+        except ValueError:
+            idx = -1
+        words[0] = WAKE_PRESETS[(idx + 1) % len(WAKE_PRESETS)]
+        cfg["wake_words"] = words
+        return True
+    return False
+
+
+def row_at(x, y):
+    if x < PAD or x > W - PAD:
+        return -1
+    if y < ROWS_TOP or y > ROWS_TOP + 6 * (ROW_H + GAP):
+        return -1
+    idx = (y - ROWS_TOP) // (ROW_H + GAP)
+    yy = y - ROWS_TOP - idx * (ROW_H + GAP)
+    return idx if 0 <= idx <= 5 and yy <= ROW_H else -1
+
+
+cfg = load_cfg()
+st = load_state()
+draw_ui(cfg, st)
+try:
+    img.save(UI_SNAPSHOT)  # 自检快照（远程验证 UI 内容用）
+    print("[xiaozhi-app] ui snapshot saved", flush=True)
+except Exception as e:
+    print("[xiaozhi-app] snapshot err:", e, flush=True)
+
+# 优雅退出：SIGTERM/SIGINT（systemd 停止 / launcher 停止）→ 正常释放 VO
+signal.signal(signal.SIGTERM, lambda s, f: app.set_exit_flag(True))
+signal.signal(signal.SIGINT, lambda s, f: app.set_exit_flag(True))
+
+print("[xiaozhi-app] loop start", flush=True)
+pressed_already = False
+last_poll = 0
+dirty = False
+snap_done = True
+
+while not app.need_exit():
+    x, y, pressed = ts.read()
+    if pressed:
+        pressed_already = True
+    elif pressed_already:
+        pressed_already = False
+        if in_btn(x, y, EXIT_BTN):
+            print("[xiaozhi-app] exit button", flush=True)
+            app.set_exit_flag(True)
+            continue
+        r = row_at(x, y)
+        if r >= 0 and click(r, x, cfg):
+            save_cfg(cfg)
+            dirty = True
+            time.sleep_ms(150)
+
+    now = time.ticks_ms()
+    if now - last_poll > 1500:          # 短间隔轮询状态文件刷新显示
+        last_poll = now
+        new_st = load_state()
+        new_cfg = load_cfg()
+        if new_st != st or new_cfg != cfg:
+            st, cfg = new_st, new_cfg
+            dirty = True
+
+    if dirty:
+        draw_ui(cfg, st)
+        dirty = False
+        if not snap_done:
+            snap_done = True
+            try:
+                img.save(UI_SNAPSHOT)
+            except Exception:
+                pass
+
+    disp.show(img)                       # 文档模式：循环内 show
+    time.sleep_ms(20)                    # 释放 CPU
+
+print("[xiaozhi-app] clean exit", flush=True)

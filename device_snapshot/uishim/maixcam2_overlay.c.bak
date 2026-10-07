@@ -1,0 +1,425 @@
+/*
+ * maixcam2_overlay.c — 状态栏/弹窗图标注入库（LD_PRELOAD）
+ *
+ * 原理：launcher 进程通过 libmaixcam_lib.so 导出的动态符号
+ *   maix::middleware::maixcam2::VO::push(int, int, Frame*)
+ * 把整帧 640x480 BGRA8888 UI 画面送屏。本库用同名符号抢在它前面，
+ * 在送屏前把若干 RGBA 图标 alpha 混合进帧缓冲。
+ *
+ * 环境变量：
+ *   MAIXCAM2_GF=1                  总开关（0 = 不注入）
+ *   MAIXCAM2_OVL=file:x:y[:fps],.. 图标列表（状态栏 y<48；640x480 坐标系）
+ *   MAIXCAM2_GF_LOG=/tmp/xx.log    日志文件
+ *
+ * 图标文件格式（由 gen_icons.py 生成）：
+ *   偏移 0:  u32 帧数 n   偏移 4: u32 宽 w   偏移 8: u32 高 h
+ *   偏移 12: n*w*h 字节 RGBA（逐帧逐行逐像素）
+ *
+ * 特性：
+ *   - 文件 mtime 变化自动重载（后台服务可动态更新弹窗内容）
+ *   - 只在 launcher / maixvision-server 进程生效；App 进程纯透传（不污染画面）
+ *   - 符号解析三级 fallback：RTLD_NEXT -> RTLD_DEFAULT -> 扫描 /proc/self/maps
+ *     直接 dlopen 已加载的 libmaixcam_lib（解决 python3 App 进程
+ *     RTLD_LOCAL 加载导致 RTLD_NEXT 失败的问题，否则帧被丢弃＝黑屏）
+ *   - /root/uishim/DISABLE 存在时立即停用（运行时开关）
+ *   - 所有缓冲区尺寸校验，异常直接放行原始帧，绝不弄挂 launcher
+ *
+ * 编译：gcc -O2 -fPIC -shared -o libmaixcam2_overlay.so maixcam2_overlay.c -ldl -lpthread
+ */
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <sys/stat.h>
+
+#define MAX_OVLS 8
+#define MAX_ICON_BYTES (8u * 1024u * 1024u) /* 单图标上限 8MB */
+#define DISABLE_FLAG "/root/uishim/DISABLE"
+#define RELOAD_CHECK_PERIOD_MS 120 /* mtime 轮询间隔（与弹窗更新粒度平衡） */
+
+typedef struct {
+    char path[512];
+    int x, y, fps;
+    /* loaded data */
+    uint8_t *pix; /* n*w*h*4 RGBA */
+    int n, w, h;
+    int has_visible; /* any pixel alpha > 0 */
+    time_t mtime;
+    long size;
+} overlay_t;
+
+typedef int (*vo_push_fn)(void *self, int display_id, int channel, void *frame);
+
+int VO_push(void *self, int a1, int a2, void *frame)
+    __asm__("_ZN4maix10middleware8maixcam22VO4pushEiiPNS1_5FrameE");
+
+static vo_push_fn real_push = NULL;
+static overlay_t ovls[MAX_OVLS];
+static int novl = 0;
+static int gf_enabled = 1;
+static int inited = 0;
+static pthread_mutex_t ovl_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *logfile = NULL;
+
+/* ---------------- utils ---------------- */
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void gflog(const char *fmt, ...) {
+    if (!logfile) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(logfile, fmt, ap);
+    va_end(ap);
+    fflush(logfile);
+}
+
+/*
+ * 解析真实 VO::push 符号。
+ *
+ * 关键：launcher 是原生进程，libmaixcam_lib 处于全局作用域，
+ * dlsym(RTLD_NEXT) 能找到；但被 launcher 拉起的 App（python3 main.py）
+ * 里，maix 扩展模块是 Python 解释器以 RTLD_LOCAL dlopen 的，
+ * libmaixcam_lib 的符号不在全局作用域 —— RTLD_NEXT 必然失败。
+ * 旧版此处直接放弃 -> hook 返回 -1 -> 丢帧 -> App 黑屏。
+ *
+ * 因此先试全局作用域，再扫描 /proc/self/maps 找到已加载的
+ * libmaixcam_lib 精确路径 dlopen（对已加载库只是引用计数 +1，
+ * 拿到 handle 后 dlsym 不受 LOCAL 作用域限制），最后按已知
+ * soname 兒底。
+ */
+static vo_push_fn find_real_push(void) {
+    static const char SYM[] =
+        "_ZN4maix10middleware8maixcam22VO4pushEiiPNS1_5FrameE";
+    vo_push_fn p;
+
+    p = (vo_push_fn)dlsym(RTLD_NEXT, SYM);
+    if (p) return p;
+
+    p = (vo_push_fn)dlsym(RTLD_DEFAULT, SYM);
+    if (p) return p;
+
+    /* 扫描本进程地址空间中已加载的 libmaixcam_lib */
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f) {
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) {
+            char *path = strchr(line, '/');
+            if (!path) continue;
+            char *nl = strchr(path, '\n');
+            if (nl) *nl = 0;
+            if (!strstr(path, "libmaixcam_lib.so")) continue;
+            void *h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+            if (h) {
+                p = (vo_push_fn)dlsym(h, SYM);
+                if (p) {
+                    fclose(f);
+                    return p;
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    /* 兒底：按已知名字加载 */
+    static const char *knames[] = {
+        "libmaixcam_lib.so", "libmaixcam_lib.so.1",
+        "libmaixcam_lib.so.1.2.5", NULL
+    };
+    for (int i = 0; knames[i]; i++) {
+        void *h = dlopen(knames[i], RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) continue;
+        p = (vo_push_fn)dlsym(h, SYM);
+        if (p) return p;
+    }
+    return NULL;
+}
+
+/* 只对系统 UI 进程生效（launcher 及其备选 maixvision-server） */
+static int process_allowed(void) {
+    char exe[512];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+    if (strstr(exe, "launcher")) return 1;
+    if (strstr(exe, "maixvision-server")) return 1;
+    return 0;
+}
+
+/* ---------------- icon loading ---------------- */
+
+static void free_overlay(overlay_t *o) {
+    free(o->pix);
+    o->pix = NULL;
+    o->n = o->w = o->h = 0;
+    o->has_visible = 0;
+}
+
+static int load_overlay(overlay_t *o) {
+    struct stat st;
+    if (stat(o->path, &st) != 0) return -1;
+    if (o->pix && st.st_mtime == o->mtime && (long)st.st_size == o->size)
+        return 0; /* unchanged */
+    if ((unsigned long)st.st_size > MAX_ICON_BYTES) return -1;
+
+    FILE *f = fopen(o->path, "rb");
+    if (!f) return -1;
+
+    uint32_t hdr[3];
+    if (fread(hdr, 4, 3, f) != 3) {
+        fclose(f);
+        return -1;
+    }
+    uint32_t n = hdr[0], w = hdr[1], h = hdr[2];
+    if (n < 1 || n > 64 || w < 1 || h < 1 || w > 640 || h > 640) {
+        fclose(f);
+        return -1;
+    }
+    size_t need = (size_t)n * w * h * 4;
+    if ((long)need + 12 > (long)st.st_size) {
+        fclose(f);
+        return -1;
+    }
+
+    uint8_t *buf = (uint8_t *)malloc(need);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+    if (fread(buf, 1, need, f) != need) {
+        free(buf);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    int visible = 0;
+    for (size_t i = 3; i < need; i += 4) {
+        if (buf[i]) {
+            visible = 1;
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&ovl_lock);
+    free(o->pix);
+    o->pix = buf;
+    o->n = (int)n;
+    o->w = (int)w;
+    o->h = (int)h;
+    o->has_visible = visible;
+    o->mtime = st.st_mtime;
+    o->size = (long)st.st_size;
+    pthread_mutex_unlock(&ovl_lock);
+    return 1;
+}
+
+static void parse_ovl_env(char *env) {
+    char *save1 = NULL;
+    for (char *tok = strtok_r(env, ",", &save1); tok && novl < MAX_OVLS;
+         tok = strtok_r(NULL, ",", &save1)) {
+        /* file:x:y[:fps] */
+        char *p1 = strchr(tok, ':');
+        if (!p1) continue;
+        *p1 = 0;
+        int x = atoi(p1 + 1);
+        char *p2 = strchr(p1 + 1, ':');
+        int y = 0, fps = 0;
+        if (p2) {
+            *p2 = 0;
+            y = atoi(p2 + 1);
+            char *p3 = strchr(p2 + 1, ':');
+            if (p3) {
+                *p3 = 0;
+                fps = atoi(p3 + 1);
+            }
+        }
+        overlay_t *o = &ovls[novl];
+        memset(o, 0, sizeof(*o));
+        snprintf(o->path, sizeof(o->path), "%s", tok);
+        o->x = x;
+        o->y = y;
+        o->fps = fps;
+        if (load_overlay(o) > 0)
+            gflog("[ovl] loaded %s %dx%dx%d at (%d,%d)\n", o->path, o->w, o->h,
+                  o->n, o->x, o->y);
+        else
+            gflog("[ovl] initial load failed: %s (will retry)\n", o->path);
+        novl++;
+    }
+}
+
+static void init_once(void) {
+    inited = 1;
+
+    real_push = find_real_push();
+    if (!real_push) {
+        /* 仅当中间件库根本没被加载时才会走到这里；
+         * 此时无法送帧，只能丢弃并大声报错 */
+        fprintf(stderr,
+            "[maixcam2_overlay] FATAL: real VO::push unresolved, "
+            "frames will be dropped\n");
+        return;
+    }
+
+    if (!process_allowed()) {
+        gf_enabled = 0;
+        return; /* App 进程：不注入，纯透传 */
+    }
+
+    const char *gf = getenv("MAIXCAM2_GF");
+    if (gf && strcmp(gf, "0") == 0) gf_enabled = 0;
+    if (!gf_enabled) return;
+
+    const char *lg = getenv("MAIXCAM2_GF_LOG");
+    if (lg) logfile = fopen(lg, "a");
+
+    const char *env = getenv("MAIXCAM2_OVL");
+    if (env && *env) {
+        char *dup = strdup(env);
+        if (dup) {
+            parse_ovl_env(dup);
+            free(dup);
+        }
+    }
+    gflog("[ovl] init ok, overlays=%d enabled=%d\n", novl, gf_enabled);
+}
+
+/* ---------------- blending ---------------- */
+
+static void blend_icon(uint8_t *dst, int dw, int dh, const overlay_t *o,
+                       int frame_idx) {
+    pthread_mutex_lock(&ovl_lock);
+    const uint8_t *src;
+    int ow = o->w, oh = o->h, ox = o->x, oy = o->y;
+    if (!o->pix) {
+        pthread_mutex_unlock(&ovl_lock);
+        return;
+    }
+    src = o->pix + (size_t)frame_idx * ow * oh * 4;
+    for (int iy = 0; iy < oh; iy++) {
+        int dy = oy + iy;
+        if (dy < 0 || dy >= dh) continue;
+        uint8_t *drow = dst + (size_t)dy * dw * 4;
+        const uint8_t *srow = src + (size_t)iy * ow * 4;
+        for (int ix = 0; ix < ow; ix++) {
+            int dx = ox + ix;
+            if (dx < 0 || dx >= dw) continue;
+            const uint8_t *s = srow + (size_t)ix * 4;
+            unsigned a = s[3];
+            if (!a) continue;
+            uint8_t *d = drow + (size_t)dx * 4;
+            /* src RGBA -> dst BGRA */
+            if (a >= 250) {
+                d[0] = s[2]; /* B */
+                d[1] = s[1]; /* G */
+                d[2] = s[0]; /* R */
+                d[3] = 0xff;
+            } else {
+                unsigned ia = 255 - a;
+                d[0] = (uint8_t)((s[2] * a + d[0] * ia) / 255);
+                d[1] = (uint8_t)((s[1] * a + d[1] * ia) / 255);
+                d[2] = (uint8_t)((s[0] * a + d[2] * ia) / 255);
+                d[3] = 0xff;
+            }
+        }
+    }
+    pthread_mutex_unlock(&ovl_lock);
+}
+
+/* ---------------- hooked entry ---------------- */
+
+int VO_push(void *self, int display_id, int channel, void *frame) {
+    if (!inited) init_once();
+
+    if (!real_push) {
+        /* 理论上不可达：调用本函数说明中间件已加载。
+         * 限频报错避免刷爆日志 */
+        static long last_err = 0;
+        long n = now_ms();
+        if (n - last_err > 5000) {
+            last_err = n;
+            gflog("[ovl] drop frame: real push unresolved\n");
+        }
+        return -1;
+    }
+
+    /* Frame layout (ax_middleware.hpp):
+     *   +0 data, +8 phy_addr, +16 len, +20 w, +24 h, +28 fmt */
+    uint8_t *fb = *(uint8_t **)frame;
+    int len = *(int *)((uint8_t *)frame + 16);
+    int w = *(int *)((uint8_t *)frame + 20);
+    int h = *(int *)((uint8_t *)frame + 24);
+
+    static long last_check = 0;
+    long now = now_ms();
+    int do_check = (now - last_check) >= RELOAD_CHECK_PERIOD_MS;
+    if (do_check) last_check = now;
+
+    /* 调试：touch /tmp/ovl_dump 后抓下一帧原始送屏内容到 /tmp/ovl_snap.raw
+     * （任何进程都可用，包括 App 进程 —— 用于远程验证画面内容） */
+    if (do_check && fb && len > 0 && access("/tmp/ovl_dump", F_OK) == 0) {
+        FILE *f = fopen("/tmp/ovl_snap.raw", "wb");
+        if (f) {
+            fwrite(fb, 1, (size_t)len, f);
+            fclose(f);
+            fprintf(stderr, "[ovl] dump frame %dx%d len=%d\n", w, h, len);
+            gflog("[ovl] frame dumped %dx%d\n", w, h);
+        }
+        unlink("/tmp/ovl_dump");
+    }
+
+    if (!gf_enabled) return real_push(self, display_id, channel, frame);
+
+    if (!fb || len <= 0 || w <= 0 || h <= 0 ||
+        (size_t)len != (size_t)w * h * 4)
+        return real_push(self, display_id, channel, frame);
+
+    static int disable_idle = 0;
+    if (do_check && access(DISABLE_FLAG, F_OK) == 0) {
+        if (!disable_idle) {
+            gflog("[ovl] DISABLE flag present — idle\n");
+            disable_idle = 1;
+        }
+        return real_push(self, display_id, channel, frame);
+    }
+    disable_idle = 0;
+
+    /* animate: frame index by fps */
+    for (int i = 0; i < novl; i++) {
+        overlay_t *o = &ovls[i];
+        if (do_check) load_overlay(o); /* reload on mtime change */
+        if (!o->pix || !o->has_visible) continue;
+        int idx = 0;
+        if (o->n > 1 && o->fps > 0) {
+            int per = 1000 / o->fps;
+            if (per < 1) per = 1;
+            idx = (int)((now / per) % o->n);
+        }
+        blend_icon(fb, w, h, o, idx);
+    }
+
+    /* 调试：touch /tmp/ovl_dump_b 抓混合后（含状态栏/弹窗）的帧 */
+    if (do_check && access("/tmp/ovl_dump_b", F_OK) == 0) {
+        FILE *f = fopen("/tmp/ovl_snap_b.raw", "wb");
+        if (f) {
+            fwrite(fb, 1, (size_t)len, f);
+            fclose(f);
+            gflog("[ovl] blended frame dumped %dx%d\n", w, h);
+        }
+        unlink("/tmp/ovl_dump_b");
+    }
+
+    return real_push(self, display_id, channel, frame);
+}

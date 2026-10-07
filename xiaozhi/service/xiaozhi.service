@@ -1,0 +1,26 @@
+[Unit]
+Description=XiaoZhi AI voice assistant service (wake word + xiaozhi cloud)
+# 关键：必须排在 launcher 之后。
+# 本服务启动时会初始化 maix 多媒体栈（maix.audio.Recorder → COMMON_SYS/AX_POOL）。
+# 若抢在 launcher 之前完成初始化，launcher 的首帧 DRM atomic commit 会永久阻塞在
+# drm_atomic_helper_wait_for_vblanks（线程进入不可中断的 D 状态），
+# 表现为「开机黑屏」，且 launcher 杀不掉，只能重启设备。
+# 实测：xiaozhi 17:14:24 先起、launcher 17:14:28 后起 → 黑屏。
+After=network-online.target launcher.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/root/xiaozhi
+# 双保险：等 launcher 真正打开了 /dev/dri/card0（= 显示已初始化）再等 2s
+ExecStartPre=/bin/sh -c 'i=0; while [ $i -lt 60 ]; do p=$(pgrep -x launcher | head -1); if [ -n "$p" ] && ls -l /proc/$p/fd 2>/dev/null | grep -q "dri/card0"; then break; fi; i=$((i+1)); sleep 0.5; done; sleep 2'
+ExecStart=/usr/bin/python3 -u /root/xiaozhi/xiaozhi_service.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=LD_LIBRARY_PATH=/root/xiaozhi/sherpa_rt/lib:/usr/local/lib:/usr/lib:/opt/lib:/opt/usr/lib:/soc/lib
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+[Install]
+WantedBy=multi-user.target

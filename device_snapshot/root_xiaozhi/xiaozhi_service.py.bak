@@ -1,0 +1,1418 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+小智AI 后台服务（MaixCAM2）— 对齐 huangjunsen0406/py-xiaozhi（GUI 除外）
+- 开机自启（systemd: xiaozhi.service）
+- 语音唤醒：sherpa-onnx KeywordSpotter（同 py-xiaozhi 模型/参数，zipformer-wenetspeech-3.3M）
+- 录音采集：maix.audio.Recorder（Sipeed 官方录音文档方法，非阻塞实时 PCM 流）
+- WebSocket 协议对齐 py-xiaozhi：hello(features.mcp=true) / listen(auto) / tts / stt / llm / mcp / goodbye
+- MCP 设备工具（JSON-RPC 2.0）：initialize / tools/list(cursor 分页) / tools/call
+    self.audio_speaker.set_volume / get_volume / get_volume_status
+    self.get_device_status / self.screen.set_brightness / get_brightness
+    custom.display.show_message（弹窗显示任意文本）
+- OTA 激活：challenge + HMAC-SHA256，激活码在 xiaozhi.me 输入
+- GUI：状态栏机器人图标 + 唤醒即弹出对话窗（深蓝面板/X/状态/表情/绿色用户气泡/白色AI气泡）
+- 配置轮询：/root/xiaozhi/config.json 短间隔轮询，设置 App 只改配置，改动立即生效
+"""
+import asyncio
+import copy
+import hashlib
+import hmac as hmac_mod
+import json
+import queue
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import threading
+import time
+import uuid as uuidlib
+
+import numpy as np
+import requests
+import websockets
+import pyaudio
+import opuslib
+from PIL import Image, ImageDraw, ImageFont
+
+# ---------------- 路径 ----------------
+BASE = "/root/xiaozhi"
+CFG_PATH = f"{BASE}/config.json"
+STATE_PATH = f"{BASE}/state.json"
+STATUS_RGBA = f"{BASE}/status.rgba"
+POPUP_RGBA = f"{BASE}/popup.rgba"
+ICON_DIR = f"{BASE}/icons"
+FONT_PATH = "/maixapp/share/font/SourceHanSansCN-Regular.otf"
+
+SHERPA_LIB = f"{BASE}/sherpa_rt/lib"           # k2-fsa 预编译 libonnxruntime 等
+KWS_MODEL_DIR = f"{BASE}/models/zh"            # py-xiaozhi 同款 zipformer KWS 模型
+KWS_KEYWORDS = f"{KWS_MODEL_DIR}/keywords_user.txt"
+
+SAMPLE_RATE = 16000
+FRAME_MS = 20                                   # py-xiaozhi: FRAME_DURATION=20
+CHUNK = SAMPLE_RATE * FRAME_MS // 1000          # 320 samples = 640 bytes
+OPUS_FRAME = CHUNK
+CHUNK_BYTES = CHUNK * 2                         # 640 字节（int16 单声道定长块）
+
+DEFAULT_CFG = {
+    "enabled": True,
+    "popup_enabled": True,
+    "touch_wake": False,
+    "wake_words": ["你好小智"],
+    "ota_url": "https://api.tenclass.net/xiaozhi/ota/",
+    "app_version": "1.0.0",
+    "client_id": "",
+    "serial_number": "",
+    "hmac_key": "",
+    "activated": False,
+    "volume": 80,
+}
+
+# 弹窗几何（对齐素材图：左侧大面板，覆盖主页左半区）
+W, H = 372, 410
+POPUP_X, POPUP_Y = 12, 56
+
+# sherpa-onnx KWS 参数（同 py-xiaozhi WAKE_WORD_OPTIONS 默认值）
+KWS_PARAMS = dict(num_threads=4, feature_dim=80, max_active_paths=2,
+                  keywords_score=1.8, keywords_threshold=0.2,
+                  num_trailing_blanks=1, provider="cpu")
+KWS_COOLDOWN = 1.5                              # py-xiaozhi 同款 1.5s 冷却
+
+# 唤醒词 → 拼音（tokens 为声母+韵母；与设置 App 的预设一致）
+KW_MAP = {
+    "你好小智": "n ǐ h ǎo x iǎo zh ì",
+    "小智": "x iǎo zh ì",
+    "嗨小智": "h āi x iǎo zh ì",
+    "你好小夏": "n ǐ h ǎo x iǎo x ià",
+    "你好小哈": "n ǐ h ǎo x iǎo h ā",
+}
+
+# ---------------- 全局状态 ----------------
+class S:
+    cfg = {}
+    loop = None
+    session_active = False
+    session_state = "idle"        # idle/connecting/listening/thinking/speaking/activation
+    detail = ""
+    activated = False
+    activation_code = ""
+    network = "未知"
+    bubbles = []                  # [(role, text)]  role: user/ai/sys
+    emotion = ""
+    wake_event_q = None
+    live = []
+    live_lock = threading.Lock()
+    play_q = []
+    play_lock = threading.Lock()
+    session_task = None
+    mic_rms = 0.0
+    rec = None                    # maix.audio.Recorder（主线程创建，录音线程使用）
+    tts_playing = False           # 播放中静音上行（防回声误触发）
+    last_error = ""
+    started_at = time.time()
+
+def log(*a):
+    print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+# ---------------- 配置 ----------------
+def load_cfg():
+    cfg = copy.deepcopy(DEFAULT_CFG)
+    try:
+        with open(CFG_PATH) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    if not cfg.get("client_id"):
+        cfg["client_id"] = str(uuidlib.uuid4())
+    if not cfg.get("serial_number"):
+        cfg["serial_number"] = uuidlib.uuid4().hex
+    if not cfg.get("hmac_key"):
+        cfg["hmac_key"] = os.urandom(32).hex()
+    save_cfg(cfg)
+    return cfg
+
+def save_cfg(cfg=None):
+    cfg = cfg or S.cfg
+    tmp = CFG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CFG_PATH)
+
+def cfg_mtime():
+    try:
+        return os.path.getmtime(CFG_PATH)
+    except OSError:
+        return 0
+
+def wake_word():
+    return (S.cfg.get("wake_words") or ["你好小智"])[0] or "你好小智"
+
+# ---------------- 状态文件 / 图标 ----------------
+def write_state():
+    st = {
+        "service": "running",
+        "state": S.session_state,
+        "detail": S.detail,
+        "activated": S.activated,
+        "activation_code": S.activation_code,
+        "network": S.network,
+        "enabled": S.cfg.get("enabled", True),
+        "popup_enabled": S.cfg.get("popup_enabled", True),
+        "wake_word": wake_word(),
+        "volume": S.cfg.get("volume", 80),
+        "mcp": True,
+        "last_error": S.last_error,
+        "uptime": int(time.time() - S.started_at),
+    }
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, ensure_ascii=False)
+    os.replace(tmp, STATE_PATH)
+
+def set_status_icon(which):
+    src = f"{ICON_DIR}/status_{which}.rgba"
+    try:
+        if os.path.exists(src):
+            shutil.copyfile(src, STATUS_RGBA)
+    except Exception as e:
+        log("status icon err:", e)
+
+# ---------------- 弹窗渲染（PIL → RGBA，素材图样式） ----------------
+_font_cache = {}
+def get_font(sz=15):
+    if sz not in _font_cache:
+        _font_cache[sz] = ImageFont.truetype(FONT_PATH, sz)
+    return _font_cache[sz]
+
+def draw_face(d, x, y, size, color=(255, 255, 255, 255), mood="neutral"):
+    """小智脸：圆环 + 双竖眼 + 嘴（情绪可变）"""
+    rw = max(3, int(size * 0.17))
+    d.ellipse([x, y, x + size, y + size], outline=color, width=rw)
+    ew = int(size * 0.17)
+    eh = int(size * 0.40)
+    gap = int(size * 0.16)
+    cx, cy = x + size / 2, y + size / 2
+    if mood in ("sad", "cry"):
+        ey = cy - eh / 2 + int(size * 0.05)
+    else:
+        ey = cy - eh / 2
+    for dx in (-1, 1):
+        x0 = cx + dx * gap - ew / 2
+        d.rounded_rectangle([x0, ey, x0 + ew, ey + eh], radius=ew / 2, fill=color)
+    # 嘴
+    mw, mh = int(size * 0.34), int(size * 0.16)
+    mx, my = cx - mw / 2, y + size * 0.66
+    if mood in ("happy", "excited", "laughing"):
+        d.arc([mx, my - mh, mx + mw, my + mh], 15, 165, fill=color, width=max(2, rw - 1))
+    elif mood in ("sad", "cry"):
+        d.arc([mx, my - mh + mh, mx + mw, my + mh + mh], 195, 345, fill=color, width=max(2, rw - 1))
+    elif mood == "angry":
+        d.line([mx, my, mx + mw, my + mh], fill=color, width=max(2, rw - 1))
+    elif mood == "thinking":
+        d.line([mx, my + mh // 2, mx + mw, my + mh // 2], fill=color, width=max(2, rw - 1))
+    else:
+        d.line([mx, my + mh // 2, mx + mw, my + mh // 2], fill=color, width=max(2, rw - 1))
+
+def draw_x(d, x, y, r, color=(235, 238, 245, 255), wdt=3):
+    d.ellipse([x, y, x + 2 * r, y + 2 * r], outline=color, width=wdt)
+    k = r * 0.55
+    cx, cy = x + r, y + r
+    d.line([cx - k, cy - k, cx + k, cy + k], fill=color, width=wdt)
+    d.line([cx - k, cy + k, cx + k, cy - k], fill=color, width=wdt)
+
+def draw_speaker(d, x, y, s, color=(140, 205, 255, 255)):
+    """小喇叭图标"""
+    d.polygon([(x, y + s * 0.35), (x + s * 0.25, y + s * 0.35),
+               (x + s * 0.55, y + s * 0.05), (x + s * 0.55, y + s * 0.95),
+               (x + s * 0.25, y + s * 0.65), (x, y + s * 0.65)], fill=color)
+    for i, k in enumerate((0.75, 1.0)):
+        d.arc([x + s * 0.5, y + s * (0.5 - 0.45 * k), x + s * (0.5 + 0.55 * k),
+               y + s * (0.5 + 0.45 * k)], -55, 55, fill=color, width=2)
+
+STATE_STYLE = {
+    "connecting": ((200, 205, 215, 255), "连接中…", "neutral"),
+    "listening": ((120, 225, 160, 255), "聆听中…", "listening"),
+    "thinking": ((255, 190, 70, 255), "思考中…", "thinking"),
+    "speaking": ((110, 175, 255, 255), "说话中…", "happy"),
+    "activation": ((255, 159, 10, 255), "待激活", "neutral"),
+}
+
+def render_popup(visible=True):
+    """渲染弹窗 → popup.rgba（原子替换，注入层自动重载）"""
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if visible and S.cfg.get("popup_enabled", True):
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([0, 0, W - 1, H - 1], radius=16,
+                            fill=(19, 31, 52, 235), outline=(64, 84, 116, 255), width=1)
+        dot_c, txt, mood = STATE_STYLE.get(
+            S.session_state, ((200, 205, 215, 255), S.session_state, "neutral"))
+        # 顶栏：X（视觉）+ 状态 + 喇叭
+        draw_x(d, 14, 14, 11)
+        st_f = get_font(16)
+        tw = d.textlength(txt, font=st_f)
+        d.text((W - 44 - tw, 14), txt, font=st_f, fill=(240, 243, 248, 255))
+        draw_speaker(d, W - 34, 16, 20, color=dot_c)
+
+        if S.session_state == "activation":
+            d.text((20, 56), "请到控制台输入激活码：", font=get_font(16),
+                   fill=(235, 238, 245, 255))
+            code = S.activation_code or "……"
+            d.rounded_rectangle([20, 88, W - 20, 136], radius=10, fill=(40, 52, 74, 255))
+            fw = get_font(30)
+            cw = d.textlength(code, font=fw)
+            d.text(((W - cw) / 2, 94), code, font=fw, fill=(255, 200, 60, 255))
+            d.text((20, 148), "xiaozhi.me 控制台", font=get_font(14),
+                   fill=(140, 150, 170, 255))
+            draw_face(d, W // 2 - 36, 220, 72, color=(255, 255, 255, 255))
+        else:
+            # 表情 + 当前情绪
+            face_c = dot_c if S.session_state != "idle" else (255, 255, 255, 255)
+            draw_face(d, 20, 58, 62, color=face_c, mood=S.emotion or mood)
+            if S.emotion:
+                d.text((94, 76), f"({S.emotion})", font=get_font(13),
+                       fill=(140, 150, 170, 255))
+            # 气泡区
+            fs = get_font(15)
+            top = 138
+            bottom = H - 40
+            drawn = []
+            total_h = 0
+            for role, text in reversed(S.bubbles[-8:]):
+                lines = wrap_text(text, fs, W - 56)
+                bh = len(lines) * 20 + 12
+                if total_h + bh > bottom - top or len(drawn) >= 5:
+                    break
+                drawn.append((role, lines, bh))
+                total_h += bh + 8
+            if not drawn:
+                hint = "说点什么吧…"
+                hw = d.textlength(hint, font=fs)
+                d.text(((W - hw) / 2, (top + bottom) / 2 - 10), hint,
+                       font=fs, fill=(120, 132, 152, 255))
+            y = bottom - total_h + 4
+            for role, lines, bh in drawn:
+                blw = max(d.textlength(ln, font=fs) for ln in lines) + 20
+                blw = min(max(blw, 48), W - 40)
+                if role == "user":
+                    x0 = W - 14 - blw
+                    fill = (149, 236, 108, 255)          # 微信绿（用户）
+                    tcol = (22, 34, 22, 255)
+                elif role == "sys":
+                    x0 = 14
+                    fill = (255, 200, 60, 255)
+                    tcol = (60, 44, 8, 255)
+                else:
+                    x0 = 14
+                    fill = (240, 242, 248, 255)          # 白色（AI）
+                    tcol = (30, 34, 44, 255)
+                d.rounded_rectangle([x0, y, x0 + blw, y + bh], radius=10, fill=fill)
+                ty = y + 6
+                for ln in lines:
+                    d.text((x0 + 10, ty), ln, font=fs, fill=tcol)
+                    ty += 20
+                y += bh + 8
+            # 底部提示
+            hint = "说「" + wake_word() + "」唤醒"
+            hw = d.textlength(hint, font=get_font(13))
+            d.text(((W - hw) / 2, H - 28), hint, font=get_font(13),
+                   fill=(110, 122, 144, 255))
+
+    tmp = POPUP_RGBA + ".tmp"
+    with open(tmp, "wb") as fp:
+        fp.write(struct.pack("<III", 1, W, H))
+        fp.write(img.tobytes())
+    os.replace(tmp, POPUP_RGBA)
+
+def wrap_text(text, font, maxw):
+    text = str(text).strip()
+    if not text:
+        return [""]
+    lines, cur = [], ""
+    for ch in text:
+        if ch == "\n":
+            lines.append(cur); cur = ""; continue
+        if font.getlength(cur + ch) > maxw:
+            lines.append(cur); cur = ch
+        else:
+            cur += ch
+    if cur:
+        lines.append(cur)
+    return lines[:8]
+
+# ---------------- 网络 / OTA（保留已验证流程） ----------------
+def device_mac():
+    try:
+        # py-xiaozhi 同款：小写带冒号（OTA 大小写皆可，但 WS 握手仅认小写）
+        return open("/sys/class/net/wlan0/address").read().strip().lower()
+    except Exception:
+        return "00:00:00:00:00:00"
+
+def local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+ota_info = {"ws_url": "", "token": "", "need_activation": False, "challenge": ""}
+
+def ota_poll():
+    mac = device_mac()
+    headers = {
+        "Device-Id": mac,
+        "Client-Id": S.cfg["client_id"],
+        "Content-Type": "application/json",
+        "User-Agent": f"maixcam2/xiaozhi-{S.cfg['app_version']}",
+        "Accept-Language": "zh-CN",
+        "Activation-Version": "2",
+    }
+    payload = {
+        "application": {
+            "version": S.cfg["app_version"],
+            "elf_sha256": S.cfg.get("hmac_key", "unknown"),
+        },
+        "board": {
+            "type": "maixcam2",
+            "name": "xiaozhi-maixcam2",
+            "ip": local_ip(),
+            "mac": mac,
+        },
+    }
+    r = requests.post(S.cfg["ota_url"], headers=headers,
+                      json=payload, timeout=12, verify=False)
+    if r.status_code != 200:
+        raise RuntimeError(f"OTA HTTP {r.status_code}")
+    data = r.json()
+    ws = data.get("websocket") or {}
+    ota_info["ws_url"] = ws.get("url", "")
+    ota_info["token"] = ws.get("token", "") or ""
+    S.network = "可用"
+    act = data.get("activation")
+    if act and act.get("challenge"):
+        ota_info["need_activation"] = True
+        ota_info["challenge"] = act["challenge"]
+        S.activation_code = act.get("code", "")
+        S.activated = False
+        S.cfg["activated"] = False
+        save_cfg()
+    else:
+        ota_info["need_activation"] = False
+        S.activated = True
+        S.cfg["activated"] = True
+        save_cfg()
+    return data
+
+def try_activate():
+    sn = S.cfg["serial_number"]
+    key = S.cfg["hmac_key"]
+    challenge = ota_info["challenge"]
+    sig = hmac_mod.new(key.encode(), challenge.encode(), hashlib.sha256).hexdigest()
+    url = S.cfg["ota_url"].rstrip("/") + "/activate"
+    headers = {
+        "Activation-Version": "2",
+        "Device-Id": device_mac(),
+        "Client-Id": S.cfg["client_id"],
+        "Content-Type": "application/json",
+    }
+    payload = {"Payload": {
+        "algorithm": "hmac-sha256",
+        "serial_number": sn,
+        "challenge": challenge,
+        "hmac": sig,
+    }}
+    r = requests.post(url, headers=headers, json=payload, timeout=12, verify=False)
+    if r.status_code == 200:
+        return True
+    if r.status_code == 202:
+        return False
+    log("activate HTTP", r.status_code, r.text[:120])
+    return False
+
+# ---------------- 音量（amixer，MCP 工具用） ----------------
+_PLAYBACK_CTLS = ["RX LEFT ANA GAIN", "RX RIGHT ANA GAIN",
+                  "RX LEFT DIG GAIN", "RX RIGHT DIG GAIN"]
+
+def _amixer_set(name, val):
+    try:
+        subprocess.run(["amixer", "-q", "set", name, val],
+                       capture_output=True, timeout=6)
+        return True
+    except Exception as e:
+        log("amixer set err:", name, e)
+        return False
+
+def audio_hw_init():
+    """上电解静音 + 按配置音量设置播放通路（MUTE 开关绝不能用 % 设置）"""
+    _amixer_set("DAC MUTE", "off")
+    ok = False
+    v = max(0, min(100, int(S.cfg.get("volume", 80))))
+    for c in _PLAYBACK_CTLS:
+        ok = _amixer_set(c, f"{v}%") or ok
+    return ok
+
+def get_volume():
+    try:
+        S.cfg["volume"] = int(S.cfg.get("volume", 80))
+    except Exception:
+        S.cfg["volume"] = 80
+    return int(S.cfg["volume"])
+
+def set_volume(v):
+    v = max(0, min(100, int(v)))
+    S.cfg["volume"] = v
+    save_cfg()
+    applied = audio_hw_init()
+    log("set_volume", v, "applied" if applied else "config-only")
+    return applied
+
+# ---------------- MCP 工具定义（对齐 py-xiaozhi tooling.py） ----------------
+class PropertyType:
+    BOOLEAN = "boolean"
+    INTEGER = "integer"
+    STRING = "string"
+
+class Property:
+    def __init__(self, name, ptype, default=None, min_value=None, max_value=None):
+        self.name = name
+        self.type = ptype
+        self.default = default
+        self.min_value = min_value
+        self.max_value = max_value
+
+    @property
+    def has_default(self):
+        return self.default is not None
+
+    def to_json(self):
+        r = {"type": self.type}
+        if self.has_default:
+            r["default"] = self.default
+        if self.type == PropertyType.INTEGER:
+            if self.min_value is not None:
+                r["minimum"] = self.min_value
+            if self.max_value is not None:
+                r["maximum"] = self.max_value
+        return r
+
+    def check(self, v):
+        if self.type == PropertyType.INTEGER and self.min_value is not None \
+                and v < self.min_value:
+            raise ValueError(f"{self.name}: below minimum {self.min_value}")
+        if self.type == PropertyType.INTEGER and self.max_value is not None \
+                and v > self.max_value:
+            raise ValueError(f"{self.name}: exceeds maximum {self.max_value}")
+        return v
+
+class PropertyList:
+    def __init__(self, props=None):
+        self.properties = props or []
+
+    def get_required(self):
+        return [p.name for p in self.properties if not p.has_default]
+
+    def to_json(self):
+        return {p.name: p.to_json() for p in self.properties}
+
+    def parse(self, args):
+        args = args or {}
+        out = {}
+        for p in self.properties:
+            if p.name in args:
+                v = args[p.name]
+                if p.type == PropertyType.BOOLEAN and isinstance(v, bool):
+                    out[p.name] = v
+                elif p.type == PropertyType.INTEGER and isinstance(v, (int, float)):
+                    out[p.name] = p.check(int(v))
+                elif p.type == PropertyType.STRING and isinstance(v, str):
+                    out[p.name] = v
+                else:
+                    raise ValueError(f"Invalid type for {p.name}")
+            elif p.has_default:
+                out[p.name] = p.default
+            else:
+                raise ValueError(f"Missing required argument: {p.name}")
+        return out
+
+class McpTool:
+    def __init__(self, name, description, properties, callback):
+        self.name = name
+        self.description = description
+        self.properties = properties
+        self.callback = callback
+
+    def to_json(self):
+        return {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": {
+                "type": "object",
+                "properties": self.properties.to_json(),
+                "required": self.properties.get_required(),
+            },
+        }
+
+    async def call(self, args):
+        try:
+            parsed = self.properties.parse(args)
+            if asyncio.iscoroutinefunction(self.callback):
+                result = await self.callback(parsed)
+            else:
+                result = self.callback(parsed)
+            text = "true" if result is True else \
+                "false" if result is False else str(result)
+            return json.dumps({"content": [{"type": "text", "text": text}],
+                               "isError": False})
+        except Exception as e:
+            log(f"[mcp] tool {self.name} err:", e)
+            return json.dumps({"content": [{"type": "text", "text": str(e)}],
+                               "isError": True})
+
+def _device_status_json():
+    return json.dumps({
+        "board": {"type": "maixcam2", "name": "xiaozhi-maixcam2",
+                  "ip": local_ip(), "mac": device_mac()},
+        "state": S.session_state,
+        "network": S.network,
+        "volume": get_volume(),
+        "brightness": None,
+        "brightness_supported": os.path.isdir("/sys/class/backlight"),
+        "wake_word": wake_word(),
+        "activated": bool(S.activated),
+        "session_active": bool(S.session_active),
+        "display_message": "弹窗支持 custom.display.show_message",
+    }, ensure_ascii=False)
+
+def _tool_set_volume(a):
+    applied = set_volume(a["volume"])
+    write_state()
+    return f"volume={a['volume']} applied={applied}"
+
+def _tool_get_volume(a):
+    return get_volume()
+
+def _tool_volume_status(a):
+    return json.dumps({"volume": get_volume(), "muted": get_volume() == 0,
+                       "available": True, "control": ",".join(_PLAYBACK_CTLS)},
+                      ensure_ascii=False)
+
+def _tool_get_device_status(a):
+    return _device_status_json()
+
+def _tool_set_brightness(a):
+    base = "/sys/class/backlight"
+    try:
+        dev = os.listdir(base)[0]
+        with open(f"{base}/{dev}/brightness", "w") as f:
+            f.write(str(a["brightness"]))
+        return f"brightness={a['brightness']}"
+    except Exception as e:
+        return f"brightness control not supported on this board ({e})"
+
+def _tool_get_brightness(a):
+    base = "/sys/class/backlight"
+    try:
+        dev = os.listdir(base)[0]
+        return int(open(f"{base}/{dev}/brightness").read().strip())
+    except Exception as e:
+        return f"brightness control not supported on this board ({e})"
+
+def _tool_show_message(a):
+    text = a["text"].strip()
+    dur = a.get("duration", 10)
+    S.bubbles.append(("sys", text))
+    del S.bubbles[:-8]
+    render_popup()
+    async def _clear():
+        await asyncio.sleep(max(3, min(120, dur)))
+        if S.bubbles and S.bubbles[-1] == ("sys", text):
+            S.bubbles.pop()
+            render_popup()
+    asyncio.ensure_future(_clear())
+    return "true"
+
+MCP_TOOLS = [
+    McpTool(
+        "self.audio_speaker.set_volume",
+        "Set the system speaker volume to an absolute value (0-100).\n"
+        "Use when user mentions: volume, sound, louder, quieter, mute, unmute.\n"
+        "Examples: '音量设为50', '调大声音', '声音小一点', '静音'.",
+        PropertyList([Property("volume", PropertyType.INTEGER,
+                               min_value=0, max_value=100)]),
+        _tool_set_volume),
+    McpTool(
+        "self.audio_speaker.get_volume",
+        "Get the current system speaker volume level (0-100).",
+        PropertyList(), _tool_get_volume),
+    McpTool(
+        "self.audio_speaker.get_volume_status",
+        "Get detailed speaker volume status as JSON: volume, muted, available.",
+        PropertyList(), _tool_volume_status),
+    McpTool(
+        "self.get_device_status",
+        "Get the device status as JSON: board, state, network, volume, "
+        "wake_word, activated, session_active, brightness_supported.",
+        PropertyList(), _tool_get_device_status),
+    McpTool(
+        "self.screen.set_brightness",
+        "Set screen brightness 0-100 (if supported by hardware).",
+        PropertyList([Property("brightness", PropertyType.INTEGER,
+                               min_value=0, max_value=100)]),
+        _tool_set_brightness),
+    McpTool(
+        "self.screen.get_brightness",
+        "Get screen brightness (if supported by hardware).",
+        PropertyList(), _tool_get_brightness),
+    McpTool(
+        "custom.display.show_message",
+        "在设备屏幕弹窗上显示一条文本消息（保留 duration 秒）。\n"
+        "适用于需要把结果/提醒长时间展示给用户的场景。",
+        PropertyList([Property("text", PropertyType.STRING),
+                      Property("duration", PropertyType.INTEGER, default=10,
+                               min_value=3, max_value=120)]),
+        _tool_show_message),
+]
+
+# ---------------- MCP 服务器（对齐 py-xiaozhi mcp_server.py） ----------------
+class McpServer:
+    """MCP over WebSocket：JSON-RPC 2.0，2024-11-05 规范"""
+
+    def __init__(self):
+        self.tools = list(MCP_TOOLS)
+
+    async def parse_message(self, message):
+        request_id = None
+        try:
+            data = json.loads(message) if isinstance(message, str) else message
+            if data.get("jsonrpc") != "2.0":
+                log("[mcp] invalid jsonrpc:", data.get("jsonrpc"))
+                return
+            method = data.get("method")
+            if not method:
+                return
+            if method.startswith("notifications"):
+                log("[mcp] ignore notification:", method)
+                return
+            params = data.get("params", {})
+            request_id = data.get("id")
+            if request_id is None:
+                log("[mcp] missing id for", method)
+                return
+            log(f"[mcp] method={method} id={request_id}")
+            if method == "initialize":
+                await self._handle_initialize(request_id, params)
+            elif method == "tools/list":
+                await self._handle_tools_list(request_id, params)
+            elif method == "tools/call":
+                await self._handle_tool_call(request_id, params)
+            else:
+                await self._reply_error(request_id,
+                                        f"Method not implemented: {method}")
+        except Exception as e:
+            log("[mcp] parse err:", e)
+            if request_id is not None:
+                await self._reply_error(request_id, str(e))
+
+    async def _handle_initialize(self, request_id, params):
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "xiaozhi-maixcam2",
+                           "version": S.cfg.get("app_version", "1.0.0")},
+        }
+        await self._reply_result(request_id, result)
+
+    async def _handle_tools_list(self, request_id, params):
+        cursor = params.get("cursor", "")
+        max_payload = 8000
+        tools_json = []
+        total = 0
+        found = not cursor
+        next_cursor = ""
+        for tool in self.tools:
+            if not found:
+                if tool.name == cursor:
+                    found = True
+                else:
+                    continue
+            tj = tool.to_json()
+            size = len(json.dumps(tj))
+            if total + size + 100 > max_payload:
+                next_cursor = tool.name
+                break
+            tools_json.append(tj)
+            total += size
+        result = {"tools": tools_json}
+        if next_cursor:
+            result["nextCursor"] = next_cursor
+        await self._reply_result(request_id, result)
+
+    async def _handle_tool_call(self, request_id, params):
+        name = params.get("name")
+        if not name:
+            await self._reply_error(request_id, "Missing tool name")
+            return
+        tool = next((t for t in self.tools if t.name == name), None)
+        if not tool:
+            await self._reply_error(request_id, f"Unknown tool: {name}")
+            return
+        args = params.get("arguments", {})
+        log(f"[mcp] call tool {name} args={args}")
+        try:
+            result = await tool.call(args)
+            await self._reply_result(request_id, json.loads(result))
+        except Exception as e:
+            await self._reply_error(request_id, str(e))
+
+    async def _reply_result(self, request_id, result):
+        payload = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        await send_mcp_message(payload)
+
+    async def _reply_error(self, request_id, message):
+        payload = {"jsonrpc": "2.0", "id": request_id,
+                   "error": {"code": -32603, "message": message}}
+        await send_mcp_message(payload)
+
+mcp_server = McpServer()
+
+async def send_mcp_message(payload):
+    ws = getattr(S, "ws", None)
+    if ws is None:
+        log("[mcp] no ws, drop reply")
+        return
+    msg = {"session_id": getattr(S, "session_id", ""),
+           "type": "mcp", "payload": payload}
+    await ws.send(json.dumps(msg))
+
+# ---------------- sherpa-onnx KWS 唤醒（对齐 py-xiaozhi） ----------------
+class WakeWordDetector:
+    def __init__(self):
+        self.spotter = None
+        self.stream = None
+        self.lock = threading.Lock()
+        self.kw_q = queue.Queue(maxsize=200)
+        self.last_hit = 0.0
+        self.loaded_kw = ""
+        self.ok = False
+
+    def build_keywords(self):
+        """按配置生成 keywords 文件（未知词回退 你好小智）"""
+        kw = wake_word()
+        phon = KW_MAP.get(kw) or KW_MAP["你好小智"]
+        try:
+            with open(KWS_KEYWORDS, "w") as f:
+                f.write(f"{phon} @{kw}\n")
+        except Exception as e:
+            log("keywords write err:", e)
+        return kw
+
+    def load_model(self):
+        if self.ok:
+            return True
+        try:
+            import sherpa_onnx
+        except Exception as e:
+            log("sherpa_onnx import fail:", e)
+            return False
+        need = ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
+        for f in need:
+            if not os.path.exists(f"{KWS_MODEL_DIR}/{f}"):
+                log("KWS model missing:", f)
+                return False
+        kw = self.build_keywords()
+        try:
+            with self.lock:
+                spotter = sherpa_onnx.KeywordSpotter(
+                    tokens=f"{KWS_MODEL_DIR}/tokens.txt",
+                    encoder=f"{KWS_MODEL_DIR}/encoder.onnx",
+                    decoder=f"{KWS_MODEL_DIR}/decoder.onnx",
+                    joiner=f"{KWS_MODEL_DIR}/joiner.onnx",
+                    keywords_file=KWS_KEYWORDS,
+                    sample_rate=SAMPLE_RATE, **KWS_PARAMS)
+                stream = spotter.create_stream()
+                self.spotter, self.stream = spotter, stream
+            self.loaded_kw = kw
+            self.ok = True
+            log(f"KeywordSpotter loaded: model={KWS_MODEL_DIR} keyword={kw}")
+            return True
+        except Exception as e:
+            log("KeywordSpotter load fail:", e)
+            return False
+
+    def reload_keyword(self):
+        """唤醒词配置变化：重建 spotter（先删 spotter 再删 stream，防 double free）"""
+        with self.lock:
+            spotter, stream = self.spotter, self.stream
+            self.spotter = None
+            self.stream = None
+            self.ok = False
+        try:
+            if spotter is not None:
+                del spotter
+            if stream is not None:
+                del stream
+        except Exception:
+            pass
+        return self.load_model()
+
+    def feed(self, pcm16: bytes):
+        """喂入 20ms 帧（int16 bytes）；命中回调主循环"""
+        if not self.ok:
+            return
+        try:
+            samples = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        except Exception:
+            return
+        with self.lock:
+            if not self.ok:
+                return
+            try:
+                self.stream.accept_waveform(SAMPLE_RATE, samples)
+                while self.spotter.is_ready(self.stream):
+                    self.spotter.decode_stream(self.stream)
+                res = self.spotter.get_result(self.stream)
+            except Exception as e:
+                log("kws err:", e)
+                return
+        if res and res.strip():
+            now = time.time()
+            if now - self.last_hit >= KWS_COOLDOWN:
+                self.last_hit = now
+                log("KWS hit:", res)
+                if S.loop:
+                    S.loop.call_soon_threadsafe(S.wake_event_q.put_nowait, "wake")
+
+    def fresh_stream(self):
+        """会话结束后丢弃被回声污染的状态"""
+        if not self.ok:
+            return
+        with self.lock:
+            try:
+                self.stream = self.spotter.create_stream()
+            except Exception:
+                pass
+
+kws = WakeWordDetector()
+
+# ---------------- 麦克风线程 ----------------
+# 采集按 Sipeed 官方录音文档实现（wiki.sipeed.com/maixpy/doc/zh/audio/record.html）：
+# maix.audio.Recorder 非阻塞实时 PCM 流（block=False + reset(True) + record(ms)），
+# 16000Hz / FMT_S16_LE / 单声道为官方验证过的参数组合。
+class Mic:
+    def __init__(self, rec=None):
+        self.rec = rec
+        self._acc = b""           # 累积缓冲：归一化为 CHUNK_BYTES(640B) 定长块
+
+    def open(self):
+        if self.rec is None:
+            # 兜底：主线程未建成时在此创建（maix 已在主线程导入）
+            from maix import audio as maix_audio
+            self.rec = maix_audio.Recorder(
+                sample_rate=SAMPLE_RATE,
+                format=maix_audio.Format.FMT_S16_LE,
+                channel=1, block=False)
+            self.rec.volume(100)   # 官方文档：音量 [0,100]
+        try:
+            self.rec.reset(True)   # 官方文档：非阻塞模式需 reset(True) 启动音频流
+        except Exception:
+            pass
+        log("maix.audio Recorder 就绪 sr=", self.rec.sample_rate())
+
+    def read_chunk(self):
+        """产出一个 640B(20ms) 定长 PCM 块；暂时无数据返回 None"""
+        try:
+            data = self.rec.record(FRAME_MS)
+            if data:
+                self._acc += bytes(data)
+        except Exception as e:
+            log("mic read err:", e)
+            time.sleep(0.2)
+            return None
+        # 缓冲积压 >200ms 时排空，防止延迟持续增长（文档 get_remaining_frames）
+        try:
+            grf = getattr(self.rec, "get_remaining_frames", None)
+            if grf:
+                while grf() > SAMPLE_RATE // 5:
+                    extra = self.rec.record(FRAME_MS)
+                    if not extra:
+                        break
+                    self._acc += bytes(extra)
+        except Exception:
+            pass
+        if len(self._acc) < CHUNK_BYTES:
+            return None
+        chunk = self._acc[:CHUNK_BYTES]
+        self._acc = self._acc[CHUNK_BYTES:]
+        return chunk
+
+    def close(self):
+        try:
+            self.rec.reset(False)  # 停止音频流
+        except Exception:
+            pass
+
+def mic_thread():
+    global mic
+    try:
+        mic = Mic(getattr(S, "rec", None))
+        mic.open()
+    except Exception as e:
+        S.last_error = f"麦克风打开失败: {e}"
+        log(S.last_error)
+        write_state()
+        return
+    while True:
+        chunk = mic.read_chunk()
+        if chunk is None:
+            time.sleep(0.005)     # 非阻塞模式：无数据时短暂让出 CPU
+            continue
+        arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        S.mic_rms = float(np.sqrt(np.mean(arr * arr)) + 1e-6)
+        with S.live_lock:
+            S.live.append(chunk)
+            if len(S.live) > 400:
+                del S.live[: len(S.live) - 400]
+        # KWS 只在空闲且启用时工作（sherpa-onnx 是唯一唤醒引擎）
+        if not S.session_active and S.cfg.get("enabled", True):
+            kws.feed(chunk)
+
+mic = None
+
+# ---------------- 触摸唤醒线程 ----------------
+def touch_thread(loop, trigger_q):
+    try:
+        from maix import touchscreen
+        ts = touchscreen.TouchScreen()
+    except Exception as e:
+        log("touch unavailable:", e)
+        return
+    last = 0
+    while True:
+        try:
+            x, y, pressed = ts.read()
+        except Exception:
+            time.sleep(0.5)
+            continue
+        if pressed and time.time() - last > 2:
+            last = time.time()
+            if not S.session_active and S.cfg.get("touch_wake", False) \
+                    and S.cfg.get("enabled", True):
+                log("触摸唤醒")
+                loop.call_soon_threadsafe(trigger_q.put_nowait, "wake")
+        time.sleep(0.05)
+
+# ---------------- 播放线程（按采样率自适应） ----------------
+def play_thread(pa=None):
+    pa = pa or pyaudio.PyAudio()
+    stream = None
+    while True:
+        item = None
+        with S.play_lock:
+            if S.play_q:
+                item = S.play_q.pop(0)
+        if item is None:
+            time.sleep(0.02)
+            continue
+        pcm, sr = item
+        try:
+            if stream is None or getattr(stream, "_sr", None) != sr:
+                if stream:
+                    stream.stop_stream(); stream.close()
+                stream = pa.open(format=pyaudio.paInt16, channels=1,
+                                 rate=sr, output=True, frames_per_buffer=1024)
+                stream._sr = sr
+            stream.write(pcm)
+        except Exception as e:
+            log("play err:", e)
+            stream = None
+
+# ---------------- WS 会话（对齐 py-xiaozhi 协议） ----------------
+def hello_msg():
+    return {
+        "type": "hello", "version": 1, "transport": "websocket",
+        "features": {"mcp": True},
+        "audio_params": {"format": "opus", "sample_rate": SAMPLE_RATE,
+                         "channels": 1, "frame_duration": FRAME_MS},
+    }
+
+def _popup_state(state=None, detail=None):
+    if state is not None:
+        S.session_state = state
+    if detail is not None:
+        S.detail = detail
+    render_popup()
+    write_state()
+
+async def session_run(trigger_reason="wake"):
+    S.session_active = True
+    S.emotion = ""
+    S.bubbles = []
+    S.tts_playing = False
+    with S.play_lock:
+        S.play_q.clear()
+    with S.live_lock:
+        S.live.clear()
+    ws = None
+    snd = rcv = None
+    try:
+        _popup_state("connecting", "连接服务器…")
+        set_status_icon("conn")
+
+        url = ota_info["ws_url"] or S.cfg.get("ws_url") or \
+            "wss://api.tenclass.net/xiaozhi/v1/"
+        headers = {
+            "Authorization": f"Bearer {ota_info['token']}",
+            "Protocol-Version": "1",
+            "Device-Id": device_mac(),
+            "Client-Id": S.cfg["client_id"],
+        }
+        log("WS connect:", url)
+        try:
+            ws = await asyncio.wait_for(
+                websockets.connect(url, additional_headers=headers,
+                                   ping_interval=20, ping_timeout=20,
+                                   max_size=10 * 1024 * 1024, compression=None),
+                timeout=15)
+        except TypeError:
+            ws = await asyncio.wait_for(
+                websockets.connect(url, extra_headers=headers,
+                                   ping_interval=20, ping_timeout=20,
+                                   max_size=10 * 1024 * 1024, compression=None),
+                timeout=15)
+        S.ws = ws
+        S.session_id = ""
+        await ws.send(json.dumps(hello_msg()))
+
+        enc = opuslib.Encoder(SAMPLE_RATE, 1, opuslib.APPLICATION_AUDIO)
+
+        async def sender():
+            idx = 0
+            while True:
+                with S.live_lock:
+                    if idx < len(S.live):
+                        chunk = S.live[idx]
+                        idx += 1
+                    else:
+                        chunk = None
+                if chunk is None:
+                    await asyncio.sleep(0.005)
+                    continue
+                if S.tts_playing:
+                    continue            # 播放中静音上行（防回声）
+                data = enc.encode(chunk, OPUS_FRAME)
+                await ws.send(data)
+
+        async def receiver():
+            dec = None
+            dec_sr = 24000
+            async for msg in ws:
+                if isinstance(msg, bytes):
+                    if dec is None:
+                        continue
+                    try:
+                        pcm = dec.decode(msg, 5760)
+                        with S.play_lock:
+                            S.play_q.append((pcm, dec_sr))
+                    except Exception as e:
+                        log("opus decode err:", e)
+                    continue
+                try:
+                    m = json.loads(msg)
+                except Exception:
+                    continue
+                mtype = m.get("type")
+                if mtype == "hello":
+                    S.session_id = m.get("session_id", "")
+                    ap = m.get("audio_params") or {}
+                    dec_sr = int(ap.get("sample_rate", 24000))
+                    dec = opuslib.Decoder(dec_sr, 1)
+                    log("server hello: sr=", dec_sr, "session=", S.session_id)
+                    _popup_state("listening", "聆听中")
+                    await ws.send(json.dumps({
+                        "session_id": S.session_id, "type": "listen",
+                        "state": "start", "mode": "auto"}))
+                elif mtype == "listen":
+                    log("listen:", m.get("state"))
+                elif mtype == "tts":
+                    st = m.get("state")
+                    if st == "start":
+                        S.tts_playing = True
+                        _popup_state("speaking", "说话中")
+                    elif st == "sentence_start":
+                        t = m.get("text", "")
+                        if t:
+                            S.bubbles.append(("ai", t))
+                            del S.bubbles[:-8]
+                            render_popup()
+                    elif st == "sentence_end":
+                        pass
+                    elif st == "stop":
+                        S.tts_playing = False
+                        with S.play_lock:
+                            S.play_q.clear()
+                        _popup_state("listening", "聆听中")
+                        await ws.send(json.dumps({
+                            "session_id": S.session_id, "type": "listen",
+                            "state": "start", "mode": "auto"}))
+                elif mtype == "stt":
+                    t = m.get("text", "")
+                    if t:
+                        S.bubbles.append(("user", t))
+                        del S.bubbles[:-8]
+                        _popup_state("thinking", "思考中")
+                elif mtype == "llm":
+                    emo = m.get("emotion", "")
+                    text = m.get("text", "")
+                    if text:
+                        S.bubbles.append(("ai", text))
+                        del S.bubbles[:-8]
+                    if emo:
+                        S.emotion = emo
+                    render_popup()
+                elif mtype == "mcp":
+                    payload = m.get("payload")
+                    if payload is not None:
+                        await mcp_server.parse_message(
+                            payload if isinstance(payload, str)
+                            else json.dumps(payload))
+                elif mtype == "goodbye":
+                    log("goodbye")
+                    return
+                elif mtype == "system":
+                    log("system:", str(m)[:120])
+
+        snd = asyncio.ensure_future(sender())
+        rcv = asyncio.ensure_future(receiver())
+        done, pending = await asyncio.wait({snd, rcv}, timeout=600,
+                                           return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+            try:
+                await p
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        S.last_error = "连接超时"
+        log(S.last_error)
+    except Exception as e:
+        S.last_error = str(e)[:200]
+        log("session err:", e)
+    finally:
+        S.ws = None
+        S.session_active = False
+        S.tts_playing = False
+        S.session_state = "idle"
+        S.detail = ""
+        with S.play_lock:
+            S.play_q.clear()
+        with S.live_lock:
+            S.live.clear()
+        set_status_icon("idle" if S.cfg.get("enabled", True) else "off")
+        render_popup()
+        write_state()
+        kws.fresh_stream()
+
+        async def hide_later():
+            await asyncio.sleep(6)
+            if not S.session_active:
+                render_popup(visible=False)
+        asyncio.ensure_future(hide_later())
+
+# ---------------- 激活弹窗 ----------------
+async def show_activation_popup():
+    S.session_state = "activation"
+    S.detail = "待激活"
+    render_popup()
+    write_state()
+    try:
+        await asyncio.sleep(12)
+    except asyncio.CancelledError:
+        raise
+    if S.session_state == "activation":
+        S.session_state = "idle"
+        S.detail = ""
+        render_popup(visible=False)
+        write_state()
+
+# ---------------- 主循环 ----------------
+async def main_loop():
+    S.wake_event_q = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    S.loop = loop
+
+    threading.Thread(target=mic_thread, daemon=True).start()
+    threading.Thread(target=play_thread, args=(getattr(S, "pa", None),),
+                     daemon=True).start()
+    threading.Thread(target=touch_thread, args=(loop, S.wake_event_q),
+                     daemon=True).start()
+
+    # sherpa KWS 模型加载（后台线程，避免阻塞启动）
+    def _kws_init():
+        if kws.load_model():
+            write_state()
+        else:
+            S.last_error = "sherpa KWS 模型加载失败（语音唤醒不可用）"
+            write_state()
+    threading.Thread(target=_kws_init, daemon=True).start()
+
+    render_popup(visible=False)
+    set_status_icon("idle" if S.cfg.get("enabled", True) else "off")
+
+    async def ota_loop():
+        fail = 0
+        while True:
+            try:
+                await loop.run_in_executor(None, ota_poll)
+                fail = 0
+                S.last_error = ""
+                if ota_info["need_activation"]:
+                    ok = await loop.run_in_executor(None, try_activate)
+                    if ok:
+                        log("激活成功!")
+                        ota_info["need_activation"] = False
+                        S.activated = True
+                        S.activation_code = ""
+                        if S.session_state == "activation":
+                            S.session_state = "idle"
+                            S.detail = ""
+                            render_popup(visible=False)
+                        write_state()
+                    await asyncio.sleep(5)
+                    continue
+                if not S.activated:
+                    S.activated = True
+                    S.activation_code = ""
+                    write_state()
+                await asyncio.sleep(3600)
+            except Exception as e:
+                fail += 1
+                S.network = "离线" if fail >= 2 else "连接中…"
+                S.last_error = f"OTA: {e}"[:160]
+                write_state()
+                await asyncio.sleep(min(30, 5 * fail))
+
+    asyncio.ensure_future(ota_loop())
+
+    last_cfg_check = 0
+    loaded_kw = ""
+    while True:
+        now = time.time()
+        if now - last_cfg_check > 1:
+            last_cfg_check = now
+            # 调试触发（远程端到端验证用）
+            if os.path.exists("/tmp/xz_call"):
+                os.unlink("/tmp/xz_call")
+                if not S.session_active and S.cfg.get("enabled", True):
+                    log("debug trigger: session start")
+                    if S.session_task and not S.session_task.done():
+                        S.session_task.cancel()
+                    S.session_task = asyncio.ensure_future(session_run("debug"))
+            if os.path.exists("/tmp/xz_stop"):
+                os.unlink("/tmp/xz_stop")
+                if S.session_task and not S.session_task.done():
+                    log("debug trigger: session stop")
+                    S.session_task.cancel()
+            # 配置轮询
+            m = cfg_mtime()
+            if m > getattr(S, "_cfg_mtime", 0):
+                S._cfg_mtime = m
+                old = dict(S.cfg)
+                S.cfg = load_cfg()
+                if old.get("enabled") and not S.cfg.get("enabled"):
+                    log("配置：服务已停用")
+                    if S.session_task and not S.session_task.done():
+                        S.session_task.cancel()
+                    render_popup(visible=False)
+                    set_status_icon("off")
+                elif not old.get("enabled") and S.cfg.get("enabled"):
+                    set_status_icon("idle")
+                if (old.get("wake_words") or [""])[0] != wake_word() \
+                        and kws.ok:
+                    log("配置：唤醒词变更 →", wake_word())
+                    threading.Thread(target=kws.reload_keyword,
+                                     daemon=True).start()
+                if old.get("volume") != S.cfg.get("volume"):
+                    audio_hw_init()
+                write_state()
+        try:
+            ev = await asyncio.wait_for(S.wake_event_q.get(), timeout=0.3)
+        except asyncio.TimeoutError:
+            continue
+        if not S.cfg.get("enabled", True):
+            continue
+        if not S.activated:
+            log("未激活，弹出激活码")
+            task = getattr(S, "activation_task", None)
+            if task and not task.done():
+                task.cancel()
+            S.activation_task = asyncio.ensure_future(show_activation_popup())
+            continue
+        if S.session_active:
+            log("打断当前对话")
+            with S.play_lock:
+                S.play_q.clear()
+            sess = S.session_task
+            if sess and not sess.done():
+                sess.cancel()
+            await asyncio.sleep(0.4)
+        S.session_task = asyncio.ensure_future(session_run(ev))
+        await asyncio.sleep(0.5)
+
+def main():
+    if not os.path.isdir(BASE):
+        os.makedirs(BASE, exist_ok=True)
+    S.cfg = load_cfg()
+    S._cfg_mtime = cfg_mtime()
+    S.activated = bool(S.cfg.get("activated"))
+    try:
+        requests.packages.urllib3.disable_warnings()
+    except Exception:
+        pass
+    # maix 模块必须在主线程导入
+    try:
+        import maix  # noqa: F401
+        from maix import touchscreen  # noqa: F401
+        from maix import audio as maix_audio
+        try:
+            # Sipeed 官方录音文档方法：Recorder(16k, S16_LE, 单声道) 非阻塞实时 PCM 流
+            rec = maix_audio.Recorder(
+                sample_rate=SAMPLE_RATE,
+                format=maix_audio.Format.FMT_S16_LE,
+                channel=1, block=False)
+            rec.volume(100)
+            rec.reset(True)        # 启动音频流
+            S.rec = rec
+            log("maix.audio Recorder 就绪(主线程) sr=", rec.sample_rate())
+        except Exception as e:
+            S.rec = None
+            log("maix.audio Recorder 创建失败:", e)
+        log("maix 模块就绪")
+    except Exception as e:
+        S.rec = None
+        log("maix 导入失败（录音/触摸不可用）:", e)
+    try:
+        S.pa = pyaudio.PyAudio()
+    except Exception as e:
+        S.pa = None
+        log("PyAudio 初始化失败:", e)
+    # 音量应用
+    try:
+        audio_hw_init()
+        set_volume(S.cfg.get("volume", 80))
+    except Exception:
+        pass
+    log("小智服务启动(py-xiaozhi 对齐版) mac=", device_mac(),
+        "uuid=", S.cfg["client_id"][:8])
+    write_state()
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
