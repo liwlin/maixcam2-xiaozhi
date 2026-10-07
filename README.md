@@ -110,7 +110,19 @@ ssh root@<设备IP> 'cd /root/xiaozhi_src && sh deploy.sh'
 
 ---
 
-## 六、许可与来源
+## 六、仓库里有什么 / 没有什么
 
-本项目只包含自己写的代码与排障脚本。运行时依赖（sherpa-onnx 唤醒模型、libonnxruntime 等）
-不在仓库内，需按 `xiaozhi/README.md` 说明自行准备。
+**包含**（约 58MB）：
+
+- 全部自写代码与排障脚本
+- 唤醒模型 `models/zh/`（sherpa-onnx KWS zipformer-wenetspeech-3.3M，12MB）
+- 预编译运行库 `sherpa_rt/lib/`（libsherpa-onnx + libonnxruntime，38MB）
+
+**不包含**：
+
+- `config.json` / `state.json` —— 含设备凭据（`hmac_key` / `client_id` / `serial_number`）。
+  首次启动会自动生成，模板见 `device_snapshot/root_xiaozhi/config.example.json`
+- `*.raw` / `*.rgba` 原始帧转储、`__pycache__`
+
+第三方组件的来源与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+

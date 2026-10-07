@@ -15,11 +15,16 @@ state.json
 *.pyc
 __pycache__/
 
-# ---- 设备快照里的模型与预编译库（52MB，另有来源）----
-device_snapshot/root_xiaozhi/models/
-device_snapshot/root_xiaozhi/sherpa_rt/
-device_snapshot/root_xiaozhi/sherpa_lib/
-device_snapshot/root_xiaozhi/icons/
+# ---- 唤醒模型与预编译运行库：随仓库一起分发（约 50MB，均 < 100MB 单文件上限）----
+#   device_snapshot/root_xiaozhi/models/zh/     sherpa-onnx KWS 模型（zipformer-wenetspeech-3.3M）
+#   device_snapshot/root_xiaozhi/sherpa_rt/lib/ libsherpa-onnx-*.so + libonnxruntime.so
+#   device_snapshot/root_xiaozhi/sherpa_lib/    libonnxruntime.so 软链（指向设备上的 onnxruntime 包）
+#   device_snapshot/root_xiaozhi/icons/         旧版状态栏图标（新版由 ui_render.py 生成）
+# 许可见 THIRD_PARTY.md
+# 注意：上面的 *.so / *.onnx 通配会挡住它们，这里显式放行
+!device_snapshot/root_xiaozhi/models/**/*.onnx
+!device_snapshot/root_xiaozhi/sherpa_rt/lib/*.so
+!device_snapshot/root_xiaozhi/sherpa_lib/libonnxruntime.so
 
 # ---- 系统垃圾 ----
 .DS_Store
