@@ -3,10 +3,18 @@
 把 Sipeed MaixCAM2 变成一台真正可用的小智（XiaoZhi）语音助手：**语音唤醒 → 对话 → 连续多轮 → 屏幕弹窗**。
 协议实现对齐 [py-xiaozhi](https://github.com/huangjunsen0406/py-xiaozhi) v2.1.2。
 
-设备：MaixCAM2（`maixcam2-40d4`，Ubuntu 22.04 / MaixPy 4.12.5 / Python 3.13 / 640×480 屏）
+本地开发版现有 **29 个 MCP 工具**，包含摄像头视觉问答、补光灯、板载外设、IMU实时显示与陀螺仪校准、受控外部I/O。详见 [MCP 功能清单](docs/MCP_CAPABILITIES.md) 和 [2026-10-25 开发汇总](docs/DEVELOPMENT_SUMMARY_2026-10-25.md)。外接I/O实物通信仍待验证。
+
+当前交互：语音唤醒，或在左上角圆标持续按住2秒；X结束当前对话。普通触屏不再唤醒。扬声器音量/静音仅缩放播放PCM，不修改麦克风增益。
+
+离线双模型、可视测试App和单线程唤醒优化目前属于实验；运动识别与SIoT实时分发仅完成设计，尚未新增对应MCP。可复用源码见 [可视测试App](examples/vision_model_test/) 与 [性能探针](tools/benchmarks/)，后续事项见 [NEXT_STEPS](docs/NEXT_STEPS.md)。
+
+拍照后屏幕会显示该照片 3 秒，再自动恢复聊天；调用 MCP 工具时，底部显示完整工具名称，结束后保留 3 秒。
+
+设备：MaixCAM2（`maixcam2-test-device`，Ubuntu 22.04 / MaixPy 4.12.5 / Python 3.13 / 640×480 屏）
 
 ```
-root@maixcam2-40d4:~# journalctl -u xiaozhi | tail -4
+root@maixcam2-test-device:~# journalctl -u xiaozhi | tail -4
 语音唤醒: 你好小智
 → listen start (第 1 轮)
 ← stt '你好，小智，今天天气怎么样？请用一句话告诉我。'
@@ -36,6 +44,8 @@ xiaozhi/                交付物（部署到设备的就是这个目录）
 ├── service/
 │   ├── xiaozhi_service.py   后台服务主程序（协议 / VAD / MCP / 音频 / 主循环）
 │   ├── ui_render.py         状态栏 + 聊天气泡渲染 → popup.rgba / status.rgba
+│   ├── hardware_tools.py    按需拍照、视觉分析上传、补光灯控制与停止清理
+│   ├── ui_feedback.py       照片预览与 MCP 工具名称的临时显示生命周期
 │   └── xiaozhi.service      systemd unit
 ├── app/                     设置 App（main.py / app.yaml / icon）
 ├── uishim/                  libmaixcam2_overlay.so 的源码（VO::push 注入 + 触摸接管）
@@ -126,3 +136,5 @@ ssh root@<设备IP> 'cd /root/xiaozhi_src && sh deploy.sh'
 
 第三方组件的来源与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
+
+板载用户LED、Func状态/事件、六轴IMU、RTC和ADC原始读取已接入；GPIO/I²C/SPI/UART使用本地白名单，默认不开放目标。详见 [外设验收](docs/PERIPHERAL_MCP_VALIDATION.md) 与 [访问配置](docs/IO_ACCESS.md)。

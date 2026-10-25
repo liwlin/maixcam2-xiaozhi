@@ -1,6 +1,10 @@
 # 小智AI for MaixCAM2 v2
 
-设备：`root@192.168.31.48`（maixcam2-40d4，Ubuntu 22.04 / MaixPy 4.12.5 / Python 3.13）
+本地扩展现有29个MCP工具：包含摄像头、补光灯、板载外设、IMU实时显示/陀螺仪校准与受控I/O。摄像头按需拍摄并预览3秒；补光灯使用B25/PWM6；外部目标默认关闭。接口与证据见 [MCP 清单](../docs/MCP_CAPABILITIES.md)、[开发汇总](../docs/DEVELOPMENT_SUMMARY_2026-10-25.md) 和 [访问配置](../docs/IO_ACCESS.md)。
+
+当前触摸唤醒为左上圆标持续2秒，普通触屏不触发；X结束当前会话。静音只影响播放PCM，麦克风继续工作。以下为上游历史设计记录，与上述变更冲突时以当前代码及当日验收为准。
+
+设备：`root@<device-ip>`（maixcam2-test-device，Ubuntu 22.04 / MaixPy 4.12.5 / Python 3.13）
 
 ## 一、这一版修好了什么
 
