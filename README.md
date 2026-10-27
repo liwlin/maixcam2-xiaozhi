@@ -40,6 +40,18 @@ root@maixcam2-test-device:~# journalctl -u xiaozhi | tail -4
 
 ---
 
+## SIoT 实机界面
+
+以下为开发验证时从设备捕获的 640×480 界面，内容为测试主题和消息。消息列表、图表截图来自较早阶段，尚未显示后来新增的“图像/视频”和“清空数据”入口；完整功能以当前源码及说明为准。
+
+| 主题与消息（上下滑动） | 数字消息图表 |
+|---|---|
+| ![SIoT 消息列表](docs/images/siot/messages.jpg) | ![SIoT 数字图表](docs/images/siot/numeric-chart.jpg) |
+| 消息编辑与退格键 | 图片与视频来源 |
+| ![SIoT 消息编辑](docs/images/siot/message-editor.jpg) | ![SIoT 媒体来源](docs/images/siot/media-sources.jpg) |
+| 局域网发送端/接收端 | JSON / Base64 与发送帧率 |
+| ![SIoT 局域网角色选择](docs/images/siot/lan-roles.jpg) | ![SIoT 格式与帧率](docs/images/siot/format-and-rate.jpg) |
+
 ## 一、系统组成
 
 | 部分 | 位置 | 职责 |
