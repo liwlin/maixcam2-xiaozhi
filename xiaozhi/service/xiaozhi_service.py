@@ -55,6 +55,7 @@ import opuslib
 import ui_render
 from hardware_tools import HardwareTools
 from ui_feedback import UiFeedback
+from ui_ownership import UiLeaseReader
 from peripheral_tools import BoardPeripherals, prepare_background_keys
 from imu_adapter import ImuReader
 from io_tools import ExternalIO
@@ -72,6 +73,7 @@ KWS_KEYWORDS = f"{KWS_MODEL_DIR}/keywords_user.txt"
 
 CMD_PATH = "/tmp/xz_cmd"          # overlay shim 上报的触摸命令
 UI_SNAPSHOT = "/tmp/xiaozhi_popup.png"
+external_ui = UiLeaseReader()
 
 # ---------------- 音频常量 ----------------
 SAMPLE_RATE = 16000               # 上行
@@ -248,7 +250,7 @@ def render_popup(visible=None):
     if visible is None:
         visible = S.session_state != "idle"
     allowed = S.cfg.get("enabled", True) and S.cfg.get("popup_enabled", True) \
-        and not S.popup_dismissed
+        and not S.popup_dismissed and not external_ui.active("popup")
     show = allowed and (bool(visible) or feedback.photo_jpeg is not None
                         or feedback.imu_sample is not None or bool(feedback.tool_name))
     S.popup_visible = show
@@ -328,7 +330,7 @@ def popup_wake_is_blocked(source):
         return True
     return source == "touch_hold" and (
         S.popup_visible or S.session_active
-        or not S.cfg.get("touch_wake", False))
+        or not S.cfg.get("touch_wake", False) or external_ui.active("touch_wake"))
 
 
 def poll_popup_cmds():
@@ -608,6 +610,37 @@ def _tool_show_message(message):
 
 
 hardware = HardwareTools(device_mac, lambda: S.cfg.get("client_id", ""))
+_vision_siot_bridge = None
+_vision_siot_lock = threading.Lock()
+
+
+def _get_vision_siot_bridge():
+    global _vision_siot_bridge
+    if not S.cfg.get('siot_vision_publish', True):return None
+    with _vision_siot_lock:
+        if _vision_siot_bridge is None:
+            from vision_siot import VisionSiotBridge
+            _vision_siot_bridge = VisionSiotBridge()
+        _vision_siot_bridge.start()
+        return _vision_siot_bridge
+
+
+def _vision_answer_text(answer):
+    if not isinstance(answer,str):return str(answer)
+    try:value=json.loads(answer)
+    except (ValueError,TypeError):return answer
+    if isinstance(value,dict):
+        for key in ('text','answer','result','content','description'):
+            if isinstance(value.get(key),str):return value[key]
+    return answer
+
+
+def _tool_camera_status():
+    status=hardware.camera_status()
+    status['siot']=_vision_siot_bridge.snapshot() if _vision_siot_bridge is not None else {'status':'not_started'}
+    return status
+
+
 peripherals = BoardPeripherals()
 imu_reader = ImuReader()
 external_io = None
@@ -639,16 +672,38 @@ def _peripheral_callback(component, method, *, timeout=3.0):
 async def _tool_camera_take_photo(question):
     loop = asyncio.get_running_loop()
     owner = _mcp_owner.get()
+    relay=None
+    capture_id=None
+    try:
+        # Connect while the sensor warms up, so the first photo is not dropped
+        # merely because the relay was started in the capture callback.
+        relay=await asyncio.to_thread(_get_vision_siot_bridge)
+    except Exception as exc:log('SIoT photo relay unavailable:',type(exc).__name__)
     def publish(jpeg):
         if (owner is not None and not owner._closed and S.cfg.get("enabled", True)
                 and not S.popup_dismissed):
             feedback.show_photo(owner, jpeg)
     def captured(jpeg):
+        nonlocal relay, capture_id
         try:
             loop.call_soon_threadsafe(publish, jpeg)
         except RuntimeError:
             pass  # The owning event loop has already shut down.
-    return await asyncio.to_thread(hardware.take_photo, question, on_capture=captured)
+        if (owner is not None and owner._closed) or not S.cfg.get('enabled',True):return
+        try:
+            if relay is not None:capture_id=relay.begin_capture(jpeg,question)
+        except Exception as exc:log('SIoT photo relay unavailable:',type(exc).__name__)
+    try:
+        answer=await asyncio.to_thread(hardware.take_photo, question, on_capture=captured)
+    except Exception:
+        if relay is not None and capture_id is not None:
+            try:relay.complete_capture(capture_id,'',error='云端识别未完成')
+            except Exception as exc:log('SIoT result relay unavailable:',type(exc).__name__)
+        raise
+    if relay is not None and capture_id is not None:
+        try:relay.complete_capture(capture_id,_vision_answer_text(answer))
+        except Exception as exc:log('SIoT result relay unavailable:',type(exc).__name__)
+    return answer
 
 
 MCP_TOOLS = [
@@ -664,7 +719,7 @@ MCP_TOOLS = [
             "拍摄设备摄像头前的画面并回答问题。用户让你看看、识别物品或描述眼前场景时调用；question 是关于照片的问题。",
             [Property("question", "string")], _tool_camera_take_photo),
     McpTool("self.camera.get_status", "查询摄像头视觉服务配置与最近拍摄状态，不拍照",
-            [], hardware.camera_status),
+            [], _tool_camera_status),
     McpTool("self.light.set_power", "打开或关闭摄像头旁的补光灯/照明灯，enabled 为开关",
             [Property("enabled", "boolean")], hardware.set_light_power),
     McpTool("self.light.set_brightness", "设置补光灯亮度，0关闭，1到100调光；不改变屏幕亮度",
@@ -2127,10 +2182,16 @@ async def main_loop():
     asyncio.ensure_future(lag_monitor())
 
     last_check = 0.0
+    last_external_popup = None
     while True:
         now = mono()
         if now - last_check > 0.25:
             last_check = now
+            external_popup = external_ui.active("popup")
+            if external_popup != last_external_popup:
+                last_external_popup = external_popup
+                render_popup()
+                write_state()
             if now - getattr(S, "_last_stats", 0) > 30:
                 S._last_stats = now
                 log("stats: state=%s mic=%d rms=%.0f/%.0f up=%d 丢=%d 主动弃=%d "
@@ -2274,6 +2335,7 @@ def main():
     finally:
         cleanup = [("IMU", imu_reader.close), ("board peripherals", peripherals.close),
                    ("camera/light", hardware.close)]
+        if _vision_siot_bridge is not None:cleanup.insert(0,("SIoT vision relay",_vision_siot_bridge.stop))
         if external_io is not None:
             cleanup.insert(0, ("external I/O", external_io.close))
         for name, close in cleanup:

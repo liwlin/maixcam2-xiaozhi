@@ -7,7 +7,24 @@
 
 当前交互：语音唤醒，或在左上角圆标持续按住2秒；X结束当前对话。普通触屏不再唤醒。扬声器音量/静音仅缩放播放PCM，不修改麦克风增益。
 
-离线双模型、可视测试App和单线程唤醒优化目前属于实验；运动识别与SIoT实时分发仅完成设计，尚未新增对应MCP。可复用源码见 [可视测试App](examples/vision_model_test/) 与 [性能探针](tools/benchmarks/)，后续事项见 [NEXT_STEPS](docs/NEXT_STEPS.md)。
+**SIoT 已可直接部署在 MaixCAM2 上作为局域网服务器，无需 PC 常驻。** 配套触屏监控支持主题管理、消息编辑、数字图表、图片和连续画面，以及小智拍照原图与云识别结果转发。详见 [SIoT 部署](docs/SIOT_DEPLOYMENT.md)、[图像传输与协议](docs/SIOT_MEDIA.md) 和 [监控 App](apps/siot_monitor/README.md)。
+
+离线双模型、可视测试 App 和单线程唤醒优化仍属于实验；**离线模型/App MCP、通用 SIoT 发布订阅 MCP、运动识别与检测结果分发尚未实现**。已实现的拍照转发不等同于这些功能。源码见 [可视测试 App](examples/vision_model_test/) 与 [性能探针](tools/benchmarks/)，后续事项见 [NEXT_STEPS](docs/NEXT_STEPS.md)。
+
+### 当前开发进度（2026-10-27）
+
+| 模块 | 当前状态 |
+|---|---|
+| 小智语音与触屏交互 | 真实语音对话、X 退出后再次唤醒、圆标长按 2 秒唤醒已现场确认 |
+| 29 个硬件 MCP | 摄像头、补光灯、IMU 实时显示/校准等已接入；外部 I/O 模块实物通信延期验证 |
+| SIoT 服务 | ARM64 服务部署、MQTT/网页访问、历史回读与服务重启持久化已验证；可离线局域网使用 |
+| 触屏监控 | 主题新建/二次确认删除、上下滑动、完整日期时间、退格输入、数字图表；清空数据保留主题，API 已验证，完整触屏流程待补验 |
+| 图像/视频 | 主题收图、本机摄像头、局域网 HTTP/MJPEG 共享与 HTTP/RTSP 接收；当前 Mind+ Data URL 连续显示已确认，用户反馈媒体部分基本可用 |
+| 拍照识别转发 | 原图与云识别结果通过相同 capture_id 关联，原 JPEG 字节不变；已验证真实拍照→云识别→MQTT 链路 |
+
+连续画面提供 JSON / Base64 两种格式及 2 / 5 / 10 fps 目标速率，默认 5 fps。Mind+“网络图片”请选择 Base64（完整 `data:image/jpeg;base64,...`）。实时画面为 **320×240、JPEG quality 75**；小智拍照为 **640×480**。连续图片不保存历史，SIoT 管理网页的历史列表为空不能据此判断没有发送。
+
+10 fps 档的一次订阅测量为 8 秒收到 71 帧（约 8.89 fps）；用户秒表照片显示过约 210 ms 的单次画面差。这些均不是稳定帧率或最大延迟保证，尚未达到或证明端到端 ≤100 ms。第二台 MaixCAM2/ESP32 接收显示、最新流媒体与真人语音共存、断电启动和长时间资源释放仍待验证。最新主机回归结果见下方“验证”。
 
 拍照后屏幕会显示该照片 3 秒，再自动恢复聊天；调用 MCP 工具时，底部显示完整工具名称，结束后保留 3 秒。
 
@@ -23,14 +40,16 @@ root@maixcam2-test-device:~# journalctl -u xiaozhi | tail -4
 
 ---
 
-## 一、这套东西由两部分组成
+## 一、系统组成
 
 | 部分 | 位置 | 职责 |
 |---|---|---|
 | **设置 App** | `/maixapp/apps/xiaozhi/` | 桌面图标「小智AI」。只做显示状态 + 改配置，写 `config.json` |
 | **后台服务** | `/root/xiaozhi/`（systemd 开机自启） | 唤醒词常驻监听、连服务器、本地 VAD 断句、TTS 播放、状态栏/弹窗渲染 |
+| **SIoT 服务（可选）** | `/opt/siot`、`/var/lib/siot` | 局域网 MQTT broker、网页管理与消息历史 |
+| **SIoT 监控 App（可选）** | `/maixapp/apps/siot_monitor/` | 触屏主题/消息管理、图表、图片与摄像头收发 |
 
-两边通过 `/root/xiaozhi/config.json` 和 `state.json` 交换数据，服务每 0.25s 轮询配置，改动即时生效。
+小智设置 App 与后台通过 `/root/xiaozhi/config.json` 和 `state.json` 交换数据，服务每 0.25s 轮询配置，改动即时生效。SIoT 连接配置单独保存在 `/etc/siot/monitor.json`。监控 App 使用界面所有权协调弹窗，本机摄像头预览与小智拍照通过协作锁互斥；第三方相机 App 不参与该锁。
 
 弹窗靠 `LD_PRELOAD` 注入 launcher，在 `VO::push` 里把 RGBA 图层 alpha 混合进 640×480 帧；
 弹窗可见时用 `EVIOCGRAB` 独占触摸设备，桌面不会被误触或滑动。
@@ -58,6 +77,11 @@ diag/                   排查与标定脚本（在设备上跑）
 ├── mic_cal.py                       麦克风增益标定
 └── dl_probe.py                      最小下行客户端（关键排障工具，见下）
 
+apps/siot_monitor/      SIoT 触屏监控、摄像头采集、MQTT/HTTP 媒体收发
+tools/siot/             SIoT 服务与监控 App 初装、验证工具
+tests/                  主机回归测试与平台相关检查
+docs/SIOT_*.md          SIoT 部署、协议、实测与验证边界
+
 ref/                    参考图与透视校正结果
 shots/                  实机截图 / 帧抓取结果
 device_snapshot/        改动前的原始程序（仅源码，模型与 .so 已排除）
@@ -77,6 +101,19 @@ ssh root@<设备IP> 'cd /root/xiaozhi_src && sh deploy.sh'
 
 > **动手前务必读**：[设备部署说明](xiaozhi/README.md#六重新部署)。服务必须排在 launcher **之后**启动，
 > 否则会开机黑屏（详见下）。
+
+SIoT 是独立的可选安装步骤，请按 [SIoT 部署说明](docs/SIOT_DEPLOYMENT.md) 准备经过校验的 ARM64 分发包。仓库不附带供应包、数据库或凭据；初装器拒绝覆盖已有安装，不能把初装命令直接用作升级。SIoT 局域网功能不需要互联网，小智云端对话和云识别仍需要联网。
+
+### 验证
+
+在已具备项目测试依赖的 Python 环境中运行：
+
+```sh
+python -m unittest discover -s tests
+git diff --check
+```
+
+2026-10-27 主机回归运行 391 项，389 项通过、2 项平台相关跳过。主机测试覆盖协议、队列、消息合并、媒体解析、资源所有权与交互逻辑；不能代替设备驱动、真实触屏、语音或端到端性能验收。设备实测与未验证项见 [SIoT 媒体说明](docs/SIOT_MEDIA.md#当前实测与仍待验证)。
 
 ---
 
@@ -161,6 +198,7 @@ ssh root@<设备IP> 'cd /root/xiaozhi_src && sh deploy.sh'
 - `config.json` / `state.json` —— 含设备凭据（`hmac_key` / `client_id` / `serial_number`）。
   首次启动会自动生成，模板见 `device_snapshot/root_xiaozhi/config.example.json`
 - `*.raw` / `*.rgba` 原始帧转储、`__pycache__`
+- SIoT 用户供应包、数据库、连接凭据、证书私钥和 `.runtime/` 内的测试记录、相机画面
 
 第三方组件的来源与许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 

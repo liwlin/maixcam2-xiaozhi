@@ -9,6 +9,7 @@ import time
 from urllib.parse import urlsplit
 
 import requests
+from camera_ownership import CameraLease, camera_is_busy
 
 MAX_JPEG_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -48,6 +49,11 @@ def _create_pwm():
 
 
 def _capture_jpeg():
+    with CameraLease():
+        return _capture_jpeg_owned()
+
+
+def _capture_jpeg_owned():
     from maix import camera
     cam = None
     try:
@@ -119,6 +125,7 @@ class HardwareTools:
         with self._vision_lock:
             return {'vision_configured': self._vision is not None,
                     'capture_in_progress': self._capture_lock.locked(),
+                    'camera_busy': camera_is_busy(),
                     'last_capture_bytes': self._last_capture_bytes,
                     'last_upload_ok': self._last_upload_ok,
                     'width': 640, 'height': 480}

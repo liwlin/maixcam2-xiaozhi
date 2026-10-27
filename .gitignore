@@ -16,6 +16,7 @@ state.json
 __pycache__/
 /.runtime/
 /.omx/
+/siot_MaixCam/
 
 # ---- 唤醒模型与预编译运行库：随仓库一起分发（约 50MB，均 < 100MB 单文件上限）----
 #   device_snapshot/root_xiaozhi/models/zh/     sherpa-onnx KWS 模型（zipformer-wenetspeech-3.3M）

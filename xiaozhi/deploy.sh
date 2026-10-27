@@ -29,7 +29,10 @@ mkdir -p /root/xiaozhi /maixapp/apps/xiaozhi/assets /root/uishim
 cp -f "$SRC/service/xiaozhi_service.py" /root/xiaozhi/
 cp -f "$SRC/service/ui_render.py"      /root/xiaozhi/
 cp -f "$SRC/service/hardware_tools.py" /root/xiaozhi/
+cp -f "$SRC/service/camera_ownership.py" /root/xiaozhi/
+cp -f "$SRC/service/vision_siot.py" /root/xiaozhi/
 cp -f "$SRC/service/ui_feedback.py"    /root/xiaozhi/
+cp -f "$SRC/service/ui_ownership.py"   /root/xiaozhi/
 cp -f "$SRC/service/peripheral_tools.py" /root/xiaozhi/
 cp -f "$SRC/service/imu_adapter.py"      /root/xiaozhi/
 cp -f "$SRC/service/io_tools.py"         /root/xiaozhi/

@@ -6,7 +6,7 @@ import sys
 import types
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'xiaozhi'/'service'))
 # Audio codecs are device dependencies; these tests exercise real MCP dispatch only.
@@ -30,6 +30,8 @@ class Socket:
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        p = patch.object(service,'_get_vision_siot_bridge',return_value=None)
+        p.start();self.addCleanup(p.stop)
         from ui_feedback import UiFeedback
         self.ui_threads = []
         self.feedback = UiFeedback(lambda: self.ui_threads.append(threading.get_ident()))
@@ -374,5 +376,32 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.feedback.tool_name, '')
                 self.assertEqual(ws.messages, [])
             finally: release.set()
+
+    async def test_photo_relays_original_jpeg_then_matched_cloud_text(self):
+        relay=Mock();relay.begin_capture.return_value='capture-one'
+        answer='{"text":"a test object"}'
+        def capture(question,on_capture=None):
+            on_capture(b'original-jpeg');return answer
+        with patch.object(service,'_get_vision_siot_bridge',return_value=relay),patch.object(service.hardware,'take_photo',side_effect=capture):
+            result=await service._tool_camera_take_photo('describe')
+        self.assertEqual(result,answer)
+        relay.begin_capture.assert_called_once_with(b'original-jpeg','describe')
+        relay.complete_capture.assert_called_once_with('capture-one','a test object')
+
+    async def test_siot_failure_does_not_replace_cloud_answer(self):
+        relay=Mock();relay.begin_capture.side_effect=RuntimeError('relay unavailable')
+        def capture(question,on_capture=None):on_capture(b'original');return 'cloud answer'
+        with patch.object(service,'_get_vision_siot_bridge',return_value=relay),patch.object(service.hardware,'take_photo',side_effect=capture):
+            self.assertEqual(await service._tool_camera_take_photo('describe'),'cloud answer')
+        relay.complete_capture.assert_not_called()
+
+    async def test_cloud_error_is_linked_to_the_existing_capture_id(self):
+        relay=Mock();relay.begin_capture.return_value='capture-error'
+        def capture(question,on_capture=None):
+            on_capture(b'original');raise RuntimeError('cloud unavailable')
+        with patch.object(service,'_get_vision_siot_bridge',return_value=relay),patch.object(service.hardware,'take_photo',side_effect=capture):
+            with self.assertRaises(RuntimeError):await service._tool_camera_take_photo('describe')
+        self.assertEqual(relay.complete_capture.call_args.args,('capture-error',''))
+        self.assertIn('error',relay.complete_capture.call_args.kwargs)
 
 if __name__=='__main__':unittest.main()

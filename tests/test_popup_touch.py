@@ -14,8 +14,11 @@ class PopupTouchTests(unittest.TestCase):
         self.task.done.return_value = False
         self.loop = Mock()
         self.feedback = Mock()
+        self.external_ui = Mock()
+        self.external_ui.active.return_value = False
         for obj, name, value in [
             (service, 'CMD_PATH', str(self.path)), (service, 'feedback', self.feedback),
+            (service, 'external_ui', self.external_ui),
             (service, 'render_popup', Mock()), (service, 'apply_volume', Mock()),
             (service.S, 'popup_visible', True), (service.S, 'popup_dismissed', False),
             (service.S, 'session_task', self.task), (service.S, 'activation_task', None),
